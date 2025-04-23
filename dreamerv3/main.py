@@ -120,6 +120,19 @@ def main(argv=None):
         bind(make_stream, config),
         args)
 
+####################
+# Added 23/04/2025 #
+  elif config.script == 'train_optimized':  # New option
+    embodied.run.train_optimized(
+        bind(make_agent, config),
+        bind(make_replay, config, 'replay'),
+        bind(make_env, config),
+        bind(make_stream, config),
+        bind(make_logger, config),
+        args)
+
+####################
+
   else:
     raise NotImplementedError(config.script)
 
