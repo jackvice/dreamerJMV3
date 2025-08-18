@@ -302,7 +302,6 @@ class RoverEnvFused(gym.Env):
             ),
         })
         
-        
         # Setup shared memory for fused observations
         try:
 
