@@ -1,0 +1,6 @@
+
+
+env -u LD_LIBRARY_PATH -u CUDA_HOME \
+  XLA_PYTHON_CLIENT_PREALLOCATE=false \
+  XLA_PYTHON_CLIENT_ALLOCATOR=platform \
+  python dreamerv3/main.py --configs atari100k --logdir ~/logdir/dreamer/{timestam}

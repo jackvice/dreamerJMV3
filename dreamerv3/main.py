@@ -211,9 +211,11 @@ def make_replay(config, folder, mode='train'):
 
 def make_env(config, index, **overrides):
   suite, task = config.task.split('_', 1)
-  if suite == 'memmaze':
-    from embodied.envs import from_gym
-    import memory_maze  # noqa
+  #if suite == 'memmaze':
+  #  from embodied.envs import from_gym
+  #  import memory_maze  # noqa
+  if suite == 'leorover':  # Add this block
+    import embodied.envs.leorover  # noqa - This triggers the registration
   ctor = {
       'dummy': 'embodied.envs.dummy:Dummy',
       'gym': 'embodied.envs.from_gym:FromGym',
@@ -231,6 +233,8 @@ def make_env(config, index, **overrides):
       'bsuite': 'embodied.envs.bsuite:BSuite',
       'memmaze': lambda task, **kw: from_gym.FromGym(
           f'MemoryMaze-{task}-v0', **kw),
+      #'leorover': 'embodied.envs.leorover:RoverEnvFused',
+      'leorover': 'embodied.envs.from_gym:FromGym'
   }[suite]
   if isinstance(ctor, str):
     module, cls = ctor.split(':')
