@@ -671,13 +671,13 @@ class RoverEnvFused(gym.Env):
 
         heatmap_center = self.get_center_heatmap_sum(observation)
 
-        #if heatmap_center > 0.01:
-        #    heat_reward = -0.2
+        if heatmap_center > 0.01:
+            print(heatmap_center)
         
         # Combine all rewards
         #reward = (distance_reward + heading_reward + velocity_reward) * final_reward_multiplier 
 
-        reward = (distance_reward * distance_delta_scale) - (heatmap_center * heatmap_center_scale)
+        reward = (distance_reward * distance_delta_scale) - heatmap_center
 
         
         # Debug logging
