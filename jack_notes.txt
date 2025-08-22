@@ -7,7 +7,8 @@ env LD_LIBRARY_PATH="$FILTERED_LD_LIBRARY_PATH" CUDA_HOME="" XLA_PYTHON_CLIENT_P
 
 env LD_LIBRARY_PATH="$FILTERED_LD_LIBRARY_PATH" CUDA_HOME="" XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_ALLOCATOR=platform python dreamerv3/main.py --configs leorover --logdir ~/logdir/dreamer/{timestamp}
 
-
+#for moon
+python spawn.py --trajectory_file trajectories/flat_triangle_traject_rev_2nd.sdf 
 
 ############## END Dreamerv3 commands
 

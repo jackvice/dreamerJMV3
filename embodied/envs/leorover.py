@@ -72,28 +72,12 @@ class RoverEnvFused(gym.Env):
     """Custom Environment that follows gymnasium interface with fused vision observations"""
     metadata = {'render_modes': ['human']}
     
-    def __init__(self, size=(96, 96), length=6000, scan_topic='/scan', imu_topic='/imu/data',
+    def __init__(self, size=(96, 96), length=3000, scan_topic='/scan', imu_topic='/imu/data',
                  cmd_vel_topic='/cmd_vel', world_n='inspect',
                  connection_check_timeout=30, lidar_points=32, max_lidar_range=12.0,
                  rl_obs_name='rl_observation'):
 
         super().__init__()
-        """
-        import rclpy
-        from geometry_msgs.msg import Twist, Pose, PoseArray, Point, Quaternion
-        from sensor_msgs.msg import LaserScan, Imu
-        from nav_msgs.msg import Odometry
-        from cv_bridge import CvBridge
-        from rclpy.qos import QoSProfile, ReliabilityPolicy
-        from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-        from std_srvs.srv import Empty
-        from geometry_msgs.msg import Twist
-        from gazebo_msgs.msg import EntityState
-        from gazebo_msgs.srv import SetEntityState
-        from sensor_msgs.msg import Image
-        """
-        # Initialize ROS2 node and publishers/subscribers
-        #rclpy.init() #   Dreamer creates your env in make_agent() just to read obs_space/act_space
 
         try:
             # if not initialized yet, this raises
@@ -143,10 +127,10 @@ class RoverEnvFused(gym.Env):
         # Stuck detection parameters
         #self.position_history = []
         self.stuck_threshold = 0.005   # per-step distance threshold (meters)
-        self.stuck_window = 250        # number of consecutive steps
+        self.stuck_window = 2000        # number of consecutive steps
         self._stuck_count = 0
         self._last_pos_for_stuck = None
-        self.stuck_penalty = -1 #-25.0
+        self.stuck_penalty = -5 #-25.0
 
         # Collision detection parameters
         self.collision_history = []
@@ -200,10 +184,15 @@ class RoverEnvFused(gym.Env):
 
         if self.world_name == 'inspect':
             # Navigation parameters previous
-            self.rand_goal_x_range = (-28, -4) #-19) #x(-5.4, -1) # moon y(-9.3, -0.5) # moon,  x(-3.5, 2.5) 
-            self.rand_goal_y_range = (-28, -14) #-19) # -27,-19 for inspection
-            self.rand_x_range = (-27, -6) #-19) #x(-5.4, -1) # moon y(-9.3, -0.5) # moon,  x(-3.5, 2.5) 
+            self.rand_goal_x_range = (-27, -19) #x(-5.4, -1) # moon y(-9.3, -0.5) # moon,  x(-3.5, 2.5)
+            self.rand_goal_y_range = (-27, -19) # -27,-19 for inspection
+            self.rand_x_range = (-27, -19) #x(-5.4, -1) # moon y(-9.3, -0.5) # moon,  x(-3.5, 2.5) 
             self.rand_y_range = (-27, -19) # -27,-19 for inspection
+            
+            #self.rand_goal_x_range = (-27, -4) # bigger around obstacles
+            #self.rand_goal_y_range = (-27, -14) # bigger around obstacles
+            #self.rand_x_range = (-27, -6) #-19) #x(-5.4, -1) # moon y(-9.3, -0.5) # moon,  x(-3.5, 2.5) 
+            #self.rand_y_range = (-27, -19) # -27,-19 for inspection
             self.too_far_away_low_x = -29 #for inspection
             self.too_far_away_high_x = 29 #-13 #for inspection
             self.too_far_away_low_y = -29 # for inspection
@@ -351,6 +340,7 @@ class RoverEnvFused(gym.Env):
             self.odom_callback,
             10)
 
+
     def get_fused_observation(self) -> np.ndarray:
         """Block until a new frame arrives, then return the fused observation from shared memory."""
         buf = self.rl_obs_shm.buf
@@ -389,6 +379,7 @@ class RoverEnvFused(gym.Env):
 
             time.sleep(0.001)
 
+
     def get_observation(self):
         return {
 
@@ -401,39 +392,7 @@ class RoverEnvFused(gym.Env):
                                    dtype=np.float32)
         }    
 
-    def get_center_heatmap_sum(self, observation: Dict[str, np.ndarray]) -> float:
-        """
-        Count non-zero heatmap pixels in the center 4 columns (46,47,48,49).
-        
-        Returns:
-        float: Count of non-zero pixels (returned as float to keep downstream logic unchanged).
-        """
-        fused_image = observation['image']          # [96, 96, 3], uint8 in [0, 255]
-        heatmap_channel = fused_image[:, :, 1]      # channel 1 is the heatmap
-        center_slice = heatmap_channel[:, 46:50]    # columns 46..49
-        nonzero_count = int(np.count_nonzero(center_slice))
-        return float(nonzero_count) * (0.5 / 384.0)  # maps 384 -> 0.5 
 
-
-    
-    def get_center_heatmap_sum(self, observation: Dict[str, np.ndarray]) -> float:
-        
-        #Calculate sum of heatmap values in the center 4 columns.
-    
-        #Args:
-        #     observation: Observation dict containing 'fused_image' [H, W, 3]
-        
-        #Returns:
-        #     Sum of all values in columns 46,47,48,49 of channel 1 (heatmap)
-        
-        #fused_image = observation['fused_image']  # Shape: [96, 96, 3]
-        fused_image = observation['image']  # Shape: [96, 96, 3]
-        heatmap_channel = fused_image[:, :, 1]    # Channel 1: heatmap [96, 96]
-    
-        # Sum all values in center 4 columns (46, 47, 48, 49)
-        center_sum = np.sum(heatmap_channel[:, 46:50])  # 46:50 gives columns 46,47,48,49
-    
-        return float(center_sum)
     
     def heading_controller(self, desired_heading, current_heading):
         """
@@ -463,6 +422,7 @@ class RoverEnvFused(gym.Env):
         )
 
         return np.clip(control, -self.max_angular_velocity, self.max_angular_velocity)
+
 
     def too_far_away(self):
         if ( self.current_pose.position.x < self.too_far_away_low_x or
@@ -513,23 +473,6 @@ class RoverEnvFused(gym.Env):
             print('Robot is stuck for', self.stuck_window, 'steps. Resetting.')
             return self.get_observation(), self.stuck_penalty, True, {}
 
-        
-        # Update position history
-        self.position_history.append((self.current_pose.position.x, self.current_pose.position.y))
-        if len(self.position_history) > self.stuck_window:
-            self.position_history.pop(0)
-
-        # Check if robot is stuck - do this every step once we have enough history
-        if len(self.position_history) >= self.stuck_window:
-            start_pos = self.position_history[0]
-            end_pos = self.position_history[-1]
-            distance_moved = math.sqrt((end_pos[0] - start_pos[0])**2 +
-                                       (end_pos[1] - start_pos[1])**2)
-
-            if distance_moved < self.stuck_threshold:
-                print('Robot is stuck, has moved only', distance_moved,
-                      'meters in', self.stuck_window, 'steps, resetting')
-                return self.get_observation(), self.stuck_penalty, True, {}
 
         if self.too_far_away():
             print('Too far away, resetting.')
@@ -627,10 +570,10 @@ class RoverEnvFused(gym.Env):
         Reward function that accounts for robot dynamics and gradual acceleration
         """
         # Constants
-        final_reward_multiplier = 1.1
+        #final_reward_multiplier = 1.1
         success_distance = 0.5
         distance_delta_scale = 0.9
-        heatmap_center_scale = 1.0
+        heatmap_center_scale = 1
         heat_reward = 0.0
         # Get current state info
         distance_heading_info = self.get_target_info()
@@ -671,14 +614,17 @@ class RoverEnvFused(gym.Env):
 
         heatmap_center = self.get_center_heatmap_sum(observation)
 
-        #if heatmap_center > 0.01:
-        #    heat_reward = -0.2
+        heat_reward = (heatmap_center * heatmap_center_scale)
+        
+        if self.total_steps % 40 == 0 and heatmap_center > 0.01 and self.total_steps < 100_000:
+            print('heatmap reward', heat_reward)
+            if heatmap_center >= 0.3:
+                save_fused_image_channels(observation['image'], output_dir='./heatmap_center_images')
         
         # Combine all rewards
         #reward = (distance_reward + heading_reward + velocity_reward) * final_reward_multiplier 
 
-        reward = (distance_reward * distance_delta_scale) - (heatmap_center * heatmap_center_scale)
-
+        reward = (distance_reward * distance_delta_scale) - heat_reward
         
         # Debug logging
         if self.total_steps % 1_000 == 0:# and heatmap_center > 0.01:
@@ -687,7 +633,7 @@ class RoverEnvFused(gym.Env):
             print(f"Distance: {current_distance:.3f}, Previous Distance: {self.previous_distance:.3f}, "
                   f"distance_delta: {distance_delta:.3f},  "#Heading diff: {math.degrees(heading_diff):.1f}°, "
                   f"Speed: {self.last_speed:.3f}, Current vel: {self.current_linear_velocity:.3f}, "
-                  f"Distance reward: {distance_reward:.3f}, heatmap_center: {heatmap_center:.3f}, " #Heading reward: {heading_reward:.3f}, "
+                  f"Distance reward: {distance_reward:.3f}, heat_reward: {heat_reward:.3f}, " #Heading reward: {heading_reward:.3f}, "
                   #f"Distance reward: {distance_reward:.3f}, Heading reward: {heading_reward:.3f}, "
                   #f"Velocity reward: {velocity_reward:.3f}, Total reward: {reward:.3f}")
                   f"Total reward: {reward:.3f}")
@@ -697,6 +643,30 @@ class RoverEnvFused(gym.Env):
 
         self.previous_distance = current_distance
         return reward
+
+
+    
+    def get_center_heatmap_sum(self, observation: Dict[str, np.ndarray]) -> float:
+        """
+        Count non-zero heatmap pixels in the center 4 columns (46,47,48,49).
+        
+        Returns:
+        float: Count of non-zero pixels (returned as float to keep downstream logic unchanged).
+        """
+        fused_image = observation['image']          # [96, 96, 3], uint8 in [0, 255]
+        heatmap_channel = fused_image[:, :, 1]      # channel 1 is the heatmap
+        center_slice = heatmap_channel[:, 46:50]    # columns 46..49
+        nonzero_count = int(np.count_nonzero(center_slice))
+        #for row in heatmap_channel:
+        #    print(row)
+        #print('count', nonzero_count)
+        #exit()
+        x = float(nonzero_count) / 384.0  # normalize to [0,1]
+        k = 2.0  # 0.2~close to linear; 0.5~mildly convex; 2.0~convex; 3.0~exponential
+        if abs(k) < 1e-6:
+            return x
+        return float(np.expm1(k * x) / np.expm1(k))
+
     
     
     def get_target_info(self):
@@ -823,6 +793,7 @@ class RoverEnvFused(gym.Env):
         self.episode_number += 1
         return observation
     
+
     def render(self):
         """Render the environment (optional)"""
         pass
@@ -895,6 +866,7 @@ class RoverEnvFused(gym.Env):
         """Process odometry data for velocities"""
         self.current_linear_velocity = msg.twist.twist.linear.x
         self.current_angular_velocity = msg.twist.twist.angular.z
+
 
     def _check_robot_connection(self, timeout):
         start_time = time.time()
