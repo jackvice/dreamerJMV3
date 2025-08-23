@@ -516,111 +516,6 @@ class RoverEnvFused(gym.Env):
                                             'reward': reward}
 
         
-    def step_old(self, action):
-        """Execute one time step within the environment"""
-
-        self.total_steps += 1
-        t0 = perf_counter()
-        flip_status = self.is_robot_flipped()
-        if flip_status:
-            print('Robot flipped', flip_status, ', episode done')
-            if self._step > 500:
-                print('Robot flipped on its own')
-                return self.get_observation(), -25, True, {}
-            else:
-                return self.get_observation(), 0.0, True, {} 
-        
-        # --- Simple stuck detector: consecutive steps with < threshold motion ---
-        pos = (self.current_pose.position.x, self.current_pose.position.y)
-        if self._last_pos_for_stuck is None:
-            self._last_pos_for_stuck = pos
-        else:
-            dx = pos[0] - self._last_pos_for_stuck[0]
-            dy = pos[1] - self._last_pos_for_stuck[1]
-            if math.hypot(dx, dy) < self.stuck_threshold:
-                self._stuck_count += 1
-            else:
-                self._stuck_count = 0
-            self._last_pos_for_stuck = pos
-
-        if self._stuck_count >= self.stuck_window:
-            print('Robot is stuck for', self.stuck_window, 'steps. Resetting.')
-            return self.get_observation(), self.stuck_penalty, True, {}
-
-
-        if self.too_far_away():
-            print('Too far away, resetting.')
-            return self.get_observation(), self.too_far_away_penilty, True, {}
-                
-        # Wait for new fused observation data - block indefinitely
-        t1 = perf_counter()
-
-        action = int(action)
-        # Descrete action space
-        speed_idx = action // self.n_directions
-        direction_idx = action % self.n_directions
-        
-        speed = float(self.speed_levels[speed_idx]) #float for ROS2
-        desired_heading = float(self.direction_angles[direction_idx]) #float for ROS2
-        
-        # Use existing PID controller for smooth execution
-        angular_velocity = self.heading_controller(desired_heading, 
-                                                   self.current_yaw)
-
-        twist = Twist()
-        twist.linear.x = speed
-        twist.angular.z = angular_velocity
-        self.publisher.publish(twist)
-        self.last_speed = speed
-
-        observation = self.get_observation()
-
-        # Calculate reward and components
-        reward = self.task_reward(observation)
-
-        # Check if episode is done
-        self._step += 1
-        if self._step >= self._length:
-            print(f"Episode length limit reached: {self._step} >= {self._length}")
-            #done = True #(self._step >= self._length)
-        #else:
-        done = (self._step >= self._length)
-        # Get observatio
-
-        rclpy.spin_once(self.node, timeout_sec=0.001)  # 1ms
-        
-        t_obs = perf_counter()
-
-        if self.total_steps % 10000 == 0:
-            temp_obs_target = self.get_target_info()
-            print(
-                f"current pose x,y: ({self.current_pose.position.x:.2f}, {self.current_pose.position.y:.2f}), "
-                f"Speed: {speed:.2f}, Heading: {math.degrees(self.current_yaw):.1f}°, "
-            )
-            print(
-                f"current target x,y: ({self.target_positions_x:.2f}, {self.target_positions_y:.2f}), "
-                f"distance and angle to target: ({temp_obs_target[0]:.3f}, {temp_obs_target[1]:.3f}), "
-                f"Final Reward: {reward:.3f}"
-            )        
-
-        info = {
-            'steps': self._step,
-            'total_steps': self.total_steps,
-            'reward': reward
-        }
-
-        t_end_step = perf_counter()
-        
-        if self.total_steps % 5000 == 0:
-            print(f"time_ms t1-t0:{(t1-t0)*1000}, t_obs:{(t_obs-t1)*1000}, t_total:{(t_end_step-t0)*1000}")
-        if self.total_steps % 50000 == 0:
-            save_fused_image_channels(observation['image'])
-            #print('Observation: Fused image shape:', observation['fused_image'].shape,
-            #      ', Fused image range: [', np.min(observation['fused_image']), 
-            #      ', ', np.max(observation['fused_image']), ']')
-            
-        return observation, reward, done, info
-        
 
     def update_target_pos(self):
         print('###################################################### GOAL ACHIVED!')
@@ -646,7 +541,7 @@ class RoverEnvFused(gym.Env):
         distance_reward_scale = 1.2
         heading_reward_scale = 0.03  # Increased from 0.02
         velocity_reward_scale = 0.015  # Slightly increased
-        heatmap_penalty_scale = 0.8  # Reduced from 1.0
+        heatmap_penalty_scale = 0.1  # Reduced from 1.0
         time_penalty_scale = 0.002  # Small penalty per step to encourage efficiency
         
         # Get current state info
@@ -670,7 +565,7 @@ class RoverEnvFused(gym.Env):
         
         # Heading alignment reward
         # Convert heading difference to range [-π, π]
-        heading_diff = math.atan2(math.sin(heading_diff), math.cos(heading_diff))
+        #heading_diff = math.atan2(math.sin(heading_diff), math.cos(heading_diff))
         abs_heading_diff = abs(heading_diff)
         
         if abs_heading_diff <= math.pi/2:

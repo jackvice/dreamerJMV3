@@ -11,6 +11,13 @@ def get_center_heatmap_sum(nonzero_count, k) -> float:
     return float(np.expm1(k * x) / np.expm1(k))
 
 
+from __future__ import annotations
+import numpy as np
+
+def get_center_heatmap_sum(nonzero_count: int, k: float, denom: int = 384) -> float:
+    """Monotone mapping of [0, denom] -> [0, 1] with curvature controlled by k."""
+    x = float(nonzero_count) / float(denom)
+    return float(np.expm1(k * x) / np.expm1(k))
 
 
 print('non zero cout 380, k = 5', get_center_heatmap_sum(380, 5))
@@ -27,7 +34,7 @@ print('non zero cout 380, k = 3', get_center_heatmap_sum(380, 3))
 print('non zero cout 250, k = 3', get_center_heatmap_sum(250, 3))
 print('non zero cout 50, k = 3', get_center_heatmap_sum(50, 3))
 print('')
-print('non zero cout 380, k = 2', get_center_heatmap_sum(380, 2))
+print('non zero cout 380, k = 6', get_center_heatmap_sum(380, 2))
 print('non zero cout 250, k = 2', get_center_heatmap_sum(250, 2))
 print('non zero cout 50, k = 2', get_center_heatmap_sum(50, 2))
 print('')
