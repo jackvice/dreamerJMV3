@@ -68,11 +68,13 @@ def save_fused_image_channels(fused_image: np.ndarray, output_dir: str = './out_
     
     print(f"Saved fused image channels to {output_dir}/channel_[1-3].png")
 
+
 class RoverEnvFused(gym.Env):
     """Custom Environment that follows gymnasium interface with fused vision observations"""
     metadata = {'render_modes': ['human']}
-    
-    def __init__(self, size=(96, 96), length=3000, scan_topic='/scan', imu_topic='/imu/data',
+
+    #                            length=3000 for phase 1, 4000 for phase 2
+    def __init__(self, size=(96, 96), length=4000, scan_topic='/scan', imu_topic='/imu/data',
                  cmd_vel_topic='/cmd_vel', world_n='inspect',
                  connection_check_timeout=30, lidar_points=32, max_lidar_range=12.0,
                  rl_obs_name='rl_observation'):
@@ -127,16 +129,11 @@ class RoverEnvFused(gym.Env):
         # Stuck detection parameters
         #self.position_history = []
         self.stuck_threshold = 0.005   # per-step distance threshold (meters)
-        self.stuck_window = 2000        # number of consecutive steps
+        self.stuck_window = 1000        # number of consecutive steps
         self._stuck_count = 0
         self._last_pos_for_stuck = None
         self.stuck_penalty = -5 #-25.0
 
-        # Collision detection parameters
-        self.collision_history = []
-        self.collision_window = 15  # Number of steps to check for persistent collision
-        self.collision_count = 0
-        
         # PID control parameters for heading
         self.Kp = 2.0  # Proportional gain
         self.Ki = 0.0  # Integral gain
@@ -184,19 +181,19 @@ class RoverEnvFused(gym.Env):
 
         if self.world_name == 'inspect':
             # Navigation parameters previous
-            self.rand_goal_x_range = (-27, -19) #x(-5.4, -1) # moon y(-9.3, -0.5) # moon,  x(-3.5, 2.5)
-            self.rand_goal_y_range = (-27, -19) # -27,-19 for inspection
-            self.rand_x_range = (-27, -19) #x(-5.4, -1) # moon y(-9.3, -0.5) # moon,  x(-3.5, 2.5) 
-            self.rand_y_range = (-27, -19) # -27,-19 for inspection
+            #self.rand_goal_x_range = (-26, -19) # first 500k steps, phase 1 curriculum learning
+            #self.rand_goal_y_range = (-26, -19) # first 500k steps, phase 1 curriculum learning
+            self.rand_x_range = (-26, -19) #x(-5.4, -1) # moon y(-9.3, -0.5) # moon,  x(-3.5, 2.5) 
+            self.rand_y_range = (-26, -19) # -27,-19 for inspection
             
-            #self.rand_goal_x_range = (-27, -4) # bigger around obstacles
-            #self.rand_goal_y_range = (-27, -14) # bigger around obstacles
+            self.rand_goal_x_range = (-24, -10) # bigger around obstacles, phase 2 curriculum
+            self.rand_goal_y_range = (-22, -10) # bigger around obstacles, phase 2 curriculum
             #self.rand_x_range = (-27, -6) #-19) #x(-5.4, -1) # moon y(-9.3, -0.5) # moon,  x(-3.5, 2.5) 
             #self.rand_y_range = (-27, -19) # -27,-19 for inspection
-            self.too_far_away_low_x = -29 #for inspection
-            self.too_far_away_high_x = 29 #-13 #for inspection
-            self.too_far_away_low_y = -29 # for inspection
-            self.too_far_away_high_y = 29 #-17  # 29 for inspection
+            self.too_far_away_low_x = -29.5 #for inspection
+            self.too_far_away_high_x = 29.5 #-13 #for inspection
+            self.too_far_away_low_y = -29.5 # for inspection
+            self.too_far_away_high_y = 29.5 #-17  # 29 for inspection
         elif self.world_name == 'moon': # moon is island
             # Navigation parameters previous
             self.rand_goal_x_range = (-7, 3) #(-4, 4) #x(-5.4, -1) # moon y(-9.3, -0.5) # moon,  x(-3.5, 2.5) 
@@ -217,7 +214,8 @@ class RoverEnvFused(gym.Env):
             self.too_far_away_low_y = -30 # for inspection
             self.too_far_away_high_y = 30  # 29 for inspection
         self.too_far_away_penilty = -10 # -25.0
-        self.goal_reward = 100.0
+        #self.goal_reward = 100.0 # phase 1
+        self.goal_reward = 125.0  # phase 2
         
         self.last_time = time.time()
         # Add at the end of your existing __init__ 
@@ -392,7 +390,6 @@ class RoverEnvFused(gym.Env):
                                    dtype=np.float32)
         }    
 
-
     
     def heading_controller(self, desired_heading, current_heading):
         """
@@ -436,8 +433,90 @@ class RoverEnvFused(gym.Env):
         else:
             return False
 
-        
+
     def step(self, action):
+        """Execute one time step within the environment"""
+        self.total_steps += 1
+        t0 = perf_counter()
+        
+        # Check step limit first (most efficient termination check)
+        self._step += 1
+        if self._step >= self._length:
+            print(f"Episode length limit reached: {self._step} >= {self._length}")
+            return self.get_observation(), 0.0, True, {'steps': self._step, 'total_steps': self.total_steps,
+                                                       'reward': 0.0}
+        
+        # Execute action
+        action = int(action)
+        speed_idx = action // self.n_directions
+        direction_idx = action % self.n_directions
+        speed = float(self.speed_levels[speed_idx])
+        desired_heading = float(self.direction_angles[direction_idx])
+        
+        angular_velocity = self.heading_controller(desired_heading, self.current_yaw)
+        twist = Twist()
+        twist.linear.x = speed
+        twist.angular.z = angular_velocity
+        self.publisher.publish(twist)
+        self.last_speed = speed
+        
+        # Get new observation after action
+        rclpy.spin_once(self.node, timeout_sec=0.001)
+        observation = self.get_observation()
+        t1 = perf_counter()
+        
+        # Check state-based termination conditions using new state
+        if self.is_robot_flipped():
+            reward = -25 if self._step > 500 else 0.0
+            print('Robot flipped, episode done')
+            return observation, reward, True, {'steps': self._step, 'total_steps': self.total_steps,
+                                               'reward': reward}
+        
+        # Update stuck detection
+        pos = (self.current_pose.position.x, self.current_pose.position.y)
+        if self._last_pos_for_stuck is None:
+            self._last_pos_for_stuck = pos
+        else:
+            dx, dy = pos[0] - self._last_pos_for_stuck[0], pos[1] - self._last_pos_for_stuck[1]
+            if math.hypot(dx, dy) < self.stuck_threshold:
+                self._stuck_count += 1
+            else:
+                self._stuck_count = 0
+            self._last_pos_for_stuck = pos
+        
+        if self._stuck_count >= self.stuck_window:
+            print('Robot is stuck for', self.stuck_window, 'steps. Resetting.')
+            return observation, self.stuck_penalty, True, {'steps': self._step, 'total_steps': self.total_steps,
+                                                           'reward': self.stuck_penalty}
+        
+        if self.too_far_away():
+            print('Too far away, resetting.')
+            return observation, self.too_far_away_penilty, True, {'steps': self._step,
+                                                                  'total_steps': self.total_steps,
+                                                                  'reward': self.too_far_away_penilty}
+        
+        # Calculate reward only if continuing
+        reward = self.task_reward(observation)
+        
+        # Debug output
+        if self.total_steps % 10000 == 0:
+            temp_obs_target = self.get_target_info()
+            print(f"current pose x,y: ({self.current_pose.position.x:.2f}, {self.current_pose.position.y:.2f}), "
+                  f"Speed: {speed:.2f}, Heading: {math.degrees(self.current_yaw):.1f}°")
+            print(f"current target x,y: ({self.target_positions_x:.2f}, {self.target_positions_y:.2f}), "
+                  f"distance and angle to target: ({temp_obs_target[0]:.3f}, {temp_obs_target[1]:.3f}), "
+                  f"Final Reward: {reward:.3f}")
+        
+        if self.total_steps % 5000 == 0:
+            print(f"time_ms total:{(perf_counter()-t0)*1000}, obs_get:{(t1-t0)*1000}")
+        if self.total_steps % 50000 == 0:
+            save_fused_image_channels(observation['image'])
+        
+        return observation, reward, False, {'steps': self._step, 'total_steps': self.total_steps,
+                                            'reward': reward}
+
+        
+    def step_old(self, action):
         """Execute one time step within the environment"""
 
         self.total_steps += 1
@@ -451,11 +530,6 @@ class RoverEnvFused(gym.Env):
             else:
                 return self.get_observation(), 0.0, True, {} 
         
-        #if self.collision_count > self.stuck_window:
-        #    self.collision_count = 0
-        #    print('stuck in collision, ending episode')
-        #    return self.get_observation(), -1 * self.goal_reward, True, {}  
-
         # --- Simple stuck detector: consecutive steps with < threshold motion ---
         pos = (self.current_pose.position.x, self.current_pose.position.y)
         if self._last_pos_for_stuck is None:
@@ -513,7 +587,6 @@ class RoverEnvFused(gym.Env):
         done = (self._step >= self._length)
         # Get observatio
 
-
         rclpy.spin_once(self.node, timeout_sec=0.001)  # 1ms
         
         t_obs = perf_counter()
@@ -528,8 +601,7 @@ class RoverEnvFused(gym.Env):
                 f"current target x,y: ({self.target_positions_x:.2f}, {self.target_positions_y:.2f}), "
                 f"distance and angle to target: ({temp_obs_target[0]:.3f}, {temp_obs_target[1]:.3f}), "
                 f"Final Reward: {reward:.3f}"
-            )
-        
+            )        
 
         info = {
             'steps': self._step,
@@ -550,7 +622,6 @@ class RoverEnvFused(gym.Env):
         return observation, reward, done, info
         
 
-
     def update_target_pos(self):
         print('###################################################### GOAL ACHIVED!')
         self.target_positions_x = np.random.uniform(*self.rand_goal_x_range)
@@ -567,11 +638,101 @@ class RoverEnvFused(gym.Env):
 
     def task_reward(self, observation):
         """
+        Comprehensive reward function that balances navigation efficiency, 
+        heading alignment, velocity control, and pedestrian avoidance.
+        """
+        # Constants
+        success_distance = 0.3
+        distance_reward_scale = 1.2
+        heading_reward_scale = 0.03  # Increased from 0.02
+        velocity_reward_scale = 0.015  # Slightly increased
+        heatmap_penalty_scale = 0.8  # Reduced from 1.0
+        time_penalty_scale = 0.002  # Small penalty per step to encourage efficiency
+        
+        # Get current state info
+        distance_heading_info = self.get_target_info()
+        current_distance = distance_heading_info[0]
+        heading_diff = distance_heading_info[1]
+
+        # Initialize previous distance if needed
+        if self.previous_distance is None:
+            self.previous_distance = current_distance
+            return 0.0
+        
+        # Check for goal achievement
+        if current_distance < success_distance:
+            self.update_target_pos()
+            return self.goal_reward
+        
+        # Distance progress reward (positive when getting closer)
+        distance_delta = self.previous_distance - current_distance
+        distance_reward = distance_delta * distance_reward_scale
+        
+        # Heading alignment reward
+        # Convert heading difference to range [-π, π]
+        heading_diff = math.atan2(math.sin(heading_diff), math.cos(heading_diff))
+        abs_heading_diff = abs(heading_diff)
+        
+        if abs_heading_diff <= math.pi/2:
+            # From 0 to 90 degrees: scale from 1 to 0
+            heading_alignment = 1.0 - (2 * abs_heading_diff / math.pi)
+        else:
+            # From 90 to 180 degrees: scale from 0 to -1
+            heading_alignment = -2 * (abs_heading_diff - math.pi/2) / math.pi
+        
+        heading_reward = heading_alignment * heading_reward_scale
+        
+        # Velocity reward - encourage forward movement, penalize excessive speed
+        optimal_speed = 0.7  # Target speed in m/s
+        speed_diff = abs(self.current_linear_velocity - optimal_speed)
+        if self.current_linear_velocity > 0:
+            # Reward forward movement, with bonus for optimal speed
+            velocity_reward = (self.current_linear_velocity - 0.3 * speed_diff) * velocity_reward_scale
+        else:
+            # Penalty for not moving forward
+            velocity_reward = self.current_linear_velocity * velocity_reward_scale * 2
+        
+        # Pedestrian avoidance penalty (reduced impact)
+        heatmap_center = self.get_center_heatmap_sum(observation)
+        heat_penalty = heatmap_center * heatmap_penalty_scale
+        
+        # Time efficiency penalty (small constant penalty to encourage faster completion)
+        time_penalty = time_penalty_scale
+        
+        # Combine all rewards with proper weighting
+        total_reward = (
+            distance_reward +           # Primary navigation signal
+            heading_reward +            # Orientation guidance  
+            velocity_reward +           # Movement encouragement
+            - heat_penalty +            # Pedestrian avoidance
+            - time_penalty              # Efficiency incentive
+        )
+        
+        # Bonus for making progress while well-aligned (multiplicative bonus)
+        if distance_delta > 0 and abs_heading_diff < math.pi/4:  # 45 degrees
+            alignment_bonus = distance_delta * 0.3
+            total_reward += alignment_bonus
+        
+        # Debug logging (keep existing frequency)
+        if self.total_steps % 1_000 == 0:
+            if self.total_steps % 10_000 == 0:
+                save_fused_image_channels(observation['image'])
+            print(f"Distance: {current_distance:.3f}, Δd: {distance_delta:.3f}, "
+                  f"Speed: {self.current_linear_velocity:.3f}, Heading: {math.degrees(heading_diff):.1f}°")
+            print(f"Rewards - Dist: {distance_reward:.3f}, Head: {heading_reward:.3f}, "
+                  f"Vel: {velocity_reward:.3f}, Heat: {-heat_penalty:.3f}, Total: {total_reward:.3f}")
+
+        self.previous_distance = current_distance
+        return total_reward    
+    
+    
+    def task_reward_old(self, observation):
+        """
         Reward function that accounts for robot dynamics and gradual acceleration
         """
         # Constants
         #final_reward_multiplier = 1.1
-        success_distance = 0.5
+        success_distance = 0.3 # early learning, make 0.1 for later stages 
         distance_delta_scale = 0.9
         heatmap_center_scale = 1
         heat_reward = 0.0
@@ -644,7 +805,6 @@ class RoverEnvFused(gym.Env):
         self.previous_distance = current_distance
         return reward
 
-
     
     def get_center_heatmap_sum(self, observation: Dict[str, np.ndarray]) -> float:
         """
@@ -662,9 +822,8 @@ class RoverEnvFused(gym.Env):
         #print('count', nonzero_count)
         #exit()
         x = float(nonzero_count) / 384.0  # normalize to [0,1]
-        k = 2.0  # 0.2~close to linear; 0.5~mildly convex; 2.0~convex; 3.0~exponential
-        if abs(k) < 1e-6:
-            return x
+        k = 3.0  # 0.2~close to linear; 0.5~mildly convex; 2.0~convex; 3.0~exponential
+
         return float(np.expm1(k * x) / np.expm1(k))
 
     
@@ -721,7 +880,6 @@ class RoverEnvFused(gym.Env):
         self.publisher.publish(twist)
         """Reset the environment to its initial state"""
         super().reset(seed=seed)
-        self.collision_history = []  # Clear collision history on reset
         x_insert = np.random.uniform(*self.rand_x_range)
         y_insert = np.random.uniform(*self.rand_y_range)
         
