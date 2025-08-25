@@ -1,0 +1,17 @@
+
+from transforms3d.euler import quat2euler
+import math
+import numpy as np
+
+ quat = np.array([
+     0.9935030026730497,
+     0.10466956900567688,
+     -0.0409410472590356,
+     -0.01788562699861093,
+ ])
+
+norm = np.linalg.norm(quat)
+quat_normalized = quat / norm
+roll, pitch, yaw = quat2euler(quat_normalized, axes='sxyz')
+d_yaw = math.degrees(yaw)
+print(yaw, d_yaw)

@@ -8,31 +8,27 @@ import struct
 from multiprocessing import shared_memory
 
 import rclpy
-from geometry_msgs.msg import Twist, Pose, PoseArray, Point, Quaternion
-from sensor_msgs.msg import LaserScan, Imu
+from geometry_msgs.msg import Twist, Pose, PoseArray # , Point, Quaternion
+#from sensor_msgs.msg import Imu
 from nav_msgs.msg import Odometry
 from cv_bridge import CvBridge
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from std_srvs.srv import Empty
-from gazebo_msgs.msg import EntityState
-from gazebo_msgs.srv import SetEntityState
-from sensor_msgs.msg import Image
-
+#from std_srvs.srv import Empty
+#from gazebo_msgs.msg import EntityState
+#from gazebo_msgs.srv import SetEntityState
+#from sensor_msgs.msg import Image
+from std_msgs.msg import String
 
 from transforms3d.euler import quat2euler
 from gym import spaces
 import cv2
 from collections import deque
 from time import strftime
-from typing import Optional, Dict
+from typing import Dict #Optional,
 import numpy.typing as npt
 from datetime import datetime
 from time import perf_counter
-from typing import Any, Dict, Tuple
-import gym
 from gym.envs.registration import register
-
-
 
 
 # Type definitions
@@ -56,7 +52,7 @@ def save_fused_image_channels(fused_image: np.ndarray, output_dir: str = './out_
     # Extract and save each channel
     now = datetime.now()
     time_string = now.strftime("%M_%S")
-    check_black = fused_image_uint8[:, :, 1]
+    #check_black = fused_image_uint8[:, :, 1]
     #if np.sum(check_black) == 0: # if no person don't bother writing to file
     #    return 
     for i in range(3): #(3) for depth
@@ -183,11 +179,12 @@ class RoverEnvFused(gym.Env):
             # Navigation parameters previous
             #self.rand_goal_x_range = (-26, -19) # first 500k steps, phase 1 curriculum learning
             #self.rand_goal_y_range = (-26, -19) # first 500k steps, phase 1 curriculum learning
-            self.rand_x_range = (-26, -19) #x(-5.4, -1) # moon y(-9.3, -0.5) # moon,  x(-3.5, 2.5) 
-            self.rand_y_range = (-26, -19) # -27,-19 for inspection
-            
+            #self.rand_x_range = (-25, -10) #x(-5.4, -1) # moon y(-9.3, -0.5) # moon,  x(-3.5, 2.5) 
+            #self.rand_y_range = (-25, -19) # -27,-19 for inspection
+            self.rand_x_range = (-24, -10) # same as phase 2 goals
+            self.rand_y_range = (-22, -8) # same as phase 2 goals
             self.rand_goal_x_range = (-24, -10) # bigger around obstacles, phase 2 curriculum
-            self.rand_goal_y_range = (-22, -10) # bigger around obstacles, phase 2 curriculum
+            self.rand_goal_y_range = (-22, -8) # bigger around obstacles, phase 2 curriculum
             #self.rand_x_range = (-27, -6) #-19) #x(-5.4, -1) # moon y(-9.3, -0.5) # moon,  x(-3.5, 2.5) 
             #self.rand_y_range = (-27, -19) # -27,-19 for inspection
             self.too_far_away_low_x = -29.5 #for inspection
@@ -298,17 +295,15 @@ class RoverEnvFused(gym.Env):
             print(f"Error attaching to RL observation shared memory: {e}")
             exit(1)
 
-        # Check robot connection - but using lidar since we still need it for rewards
-        #self._robot_connected = self._check_robot_connection(timeout=connection_check_timeout)
-        #if not self._robot_connected:
-        #    self.node.get_logger().warn("No actual robot detected. Running in simulation mode.")
             
         # Initialize publishers and subscribers
         self.publisher = self.node.create_publisher(
             Twist,
             cmd_vel_topic,
             10)
-        
+
+        # Add this line after the existing cmd_vel publisher
+        self.event_publisher = self.node.create_publisher(String, '/robot/events', 10)
         """
         # Keep IMU subscriber for reward calculation  
         self.imu_subscriber = self.node.create_subscription(
@@ -382,7 +377,7 @@ class RoverEnvFused(gym.Env):
         return {
 
             'image': self.get_fused_observation(),
-            'pose': self.rover_position,
+            'pose': self.rover_position, #why is this in the observation?
             'imu': np.array([self.current_pitch, self.current_roll, self.current_yaw],
                             dtype=np.float32),
             'target': self.get_target_info(),
@@ -461,7 +456,7 @@ class RoverEnvFused(gym.Env):
         self.last_speed = speed
         
         # Get new observation after action
-        rclpy.spin_once(self.node, timeout_sec=0.001)
+        rclpy.spin_once(self.node, timeout_sec=0.01)
         observation = self.get_observation()
         t1 = perf_counter()
         
@@ -499,7 +494,8 @@ class RoverEnvFused(gym.Env):
         reward = self.task_reward(observation)
         
         # Debug output
-        if self.total_steps % 10000 == 0:
+        """
+        if self.total_steps % 10_000 == 0:
             temp_obs_target = self.get_target_info()
             print(f"current pose x,y: ({self.current_pose.position.x:.2f}, {self.current_pose.position.y:.2f}), "
                   f"Speed: {speed:.2f}, Heading: {math.degrees(self.current_yaw):.1f}°")
@@ -511,7 +507,7 @@ class RoverEnvFused(gym.Env):
             print(f"time_ms total:{(perf_counter()-t0)*1000}, obs_get:{(t1-t0)*1000}")
         if self.total_steps % 50000 == 0:
             save_fused_image_channels(observation['image'])
-        
+        """
         return observation, reward, False, {'steps': self._step, 'total_steps': self.total_steps,
                                             'reward': reward}
 
@@ -519,11 +515,17 @@ class RoverEnvFused(gym.Env):
 
     def update_target_pos(self):
         print('###################################################### GOAL ACHIVED!')
+
+        event_msg = String()
+        event_msg.data = "goal_reached"
+        self.event_publisher.publish(event_msg)
+    
         self.target_positions_x = np.random.uniform(*self.rand_goal_x_range)
         self.target_positions_y = np.random.uniform(*self.rand_goal_y_range)
         print(f'\nNew target x,y: {self.target_positions_x:.2f}, {self.target_positions_y:.2f}')
         self.previous_distance = None
-        timestamp = time.time()
+        #timestamp = time.time()
+        
         #with open(f'{self.episode_log_path}/{self.log_name}', 'a') as f:
         #    f.write(f"{timestamp},goal_reached,{self.episode_number-1},x={self.current_pose.position.x:.2f},y={self.current_pose.position.y:.2f}\n")
         #    f.write(f"{timestamp},episode_start,{self.episode_number},x={self.current_pose.position.x:.2f},y={self.current_pose.position.y:.2f}\n")
@@ -538,11 +540,12 @@ class RoverEnvFused(gym.Env):
         """
         # Constants
         success_distance = 0.3
-        distance_reward_scale = 1.2
+        distance_reward_scale = 1.4
         heading_reward_scale = 0.03  # Increased from 0.02
         velocity_reward_scale = 0.015  # Slightly increased
         heatmap_penalty_scale = 0.1  # Reduced from 1.0
         time_penalty_scale = 0.002  # Small penalty per step to encourage efficiency
+        spin_penalty_scale = 1.3
         
         # Get current state info
         distance_heading_info = self.get_target_info()
@@ -594,112 +597,35 @@ class RoverEnvFused(gym.Env):
         # Time efficiency penalty (small constant penalty to encourage faster completion)
         time_penalty = time_penalty_scale
         
+        # Penalize spinning more when not moving forward
+        spin_penalty = spin_penalty_scale * (abs(self.current_angular_velocity) *
+                                       max(0.01, 0.02 - self.current_linear_velocity * 0.01))
         # Combine all rewards with proper weighting
         total_reward = (
             distance_reward +           # Primary navigation signal
             heading_reward +            # Orientation guidance  
-            velocity_reward +           # Movement encouragement
-            - heat_penalty +            # Pedestrian avoidance
-            - time_penalty              # Efficiency incentive
+            velocity_reward -           # Movement encouragement
+            heat_penalty -              # Pedestrian avoidance
+            time_penalty -              # Efficiency incentive
+            spin_penalty                # keep from spinning
         )
         
         # Bonus for making progress while well-aligned (multiplicative bonus)
         if distance_delta > 0 and abs_heading_diff < math.pi/4:  # 45 degrees
             alignment_bonus = distance_delta * 0.3
             total_reward += alignment_bonus
-        
-        # Debug logging (keep existing frequency)
-        if self.total_steps % 1_000 == 0:
+
+
+        if self.total_steps % 2_000 == 0:
             if self.total_steps % 10_000 == 0:
                 save_fused_image_channels(observation['image'])
-            print(f"Distance: {current_distance:.3f}, Δd: {distance_delta:.3f}, "
-                  f"Speed: {self.current_linear_velocity:.3f}, Heading: {math.degrees(heading_diff):.1f}°")
-            print(f"Rewards - Dist: {distance_reward:.3f}, Head: {heading_reward:.3f}, "
-                  f"Vel: {velocity_reward:.3f}, Heat: {-heat_penalty:.3f}, Total: {total_reward:.3f}")
+            print(f"\nPose: ({self.current_pose.position.x:.2f}, {self.current_pose.position.y:.2f}), Target: ({self.target_positions_x:.2f}, {self.target_positions_y:.2f}), Dist: {current_distance:.3f}, Δd: {distance_delta:.3f}, Heading: {math.degrees(self.current_yaw):.1f}°, HeadDiff: {math.degrees(heading_diff):.1f}°, LinVel: {self.current_linear_velocity:.3f}, AngVel: {self.current_angular_velocity:.3f}")
+            print(f"Rewards - Dist: {distance_reward:.3f}, Head: {heading_reward:.3f}, Vel: {velocity_reward:.3f}, Heat: {-heat_penalty:.3f}, Spin: {-spin_penalty:.3f}, Total: {total_reward:.3f}")
+            
 
         self.previous_distance = current_distance
         return total_reward    
     
-    
-    def task_reward_old(self, observation):
-        """
-        Reward function that accounts for robot dynamics and gradual acceleration
-        """
-        # Constants
-        #final_reward_multiplier = 1.1
-        success_distance = 0.3 # early learning, make 0.1 for later stages 
-        distance_delta_scale = 0.9
-        heatmap_center_scale = 1
-        heat_reward = 0.0
-        # Get current state info
-        distance_heading_info = self.get_target_info()
-        current_distance = distance_heading_info[0]
-        heading_diff = distance_heading_info[1]
-
-        # Initialize previous distance if needed
-        if self.previous_distance is None:
-            self.previous_distance = current_distance
-            return 0.0
-        
-        # Check for goal achievement
-        if current_distance < success_distance:
-            self.update_target_pos()
-            return self.goal_reward
-        
-        # Calculate distance change (positive means got closer, negative means got further)
-        distance_delta = self.previous_distance - current_distance
-        distance_reward = distance_delta
-        
-        # Heading component - always calculated, can be positive or negative
-        # Convert heading difference to range [-π, π]
-        heading_diff = math.atan2(math.sin(heading_diff), math.cos(heading_diff))
-        abs_heading_diff = abs(heading_diff)
-        
-        if abs_heading_diff <= math.pi/2:
-            # From 0 to 90 degrees: scale from 1 to 0
-            heading_alignment = 1.0 - (2 * abs_heading_diff / math.pi)
-        else:
-            # From 90 to 180 degrees: scale from 0 to -1
-            heading_alignment = -2 * (abs_heading_diff - math.pi/2) / math.pi
-        
-        heading_reward = 0.02 * heading_alignment  # 0.02 per step when perfect (120.0 over 6000 steps)
-
-        
-        # Velocity component - increased for 6000-step episodes
-        velocity_reward = self.current_linear_velocity * 0.01  # 1 m/s gives 60.0 over 6000 steps
-
-        heatmap_center = self.get_center_heatmap_sum(observation)
-
-        heat_reward = (heatmap_center * heatmap_center_scale)
-        
-        if self.total_steps % 40 == 0 and heatmap_center > 0.01 and self.total_steps < 100_000:
-            print('heatmap reward', heat_reward)
-            if heatmap_center >= 0.3:
-                save_fused_image_channels(observation['image'], output_dir='./heatmap_center_images')
-        
-        # Combine all rewards
-        #reward = (distance_reward + heading_reward + velocity_reward) * final_reward_multiplier 
-
-        reward = (distance_reward * distance_delta_scale) - heat_reward
-        
-        # Debug logging
-        if self.total_steps % 1_000 == 0:# and heatmap_center > 0.01:
-            if self.total_steps % 10_000 == 0:# and heatmap_center > 0.01:
-                save_fused_image_channels(observation['image'])
-            print(f"Distance: {current_distance:.3f}, Previous Distance: {self.previous_distance:.3f}, "
-                  f"distance_delta: {distance_delta:.3f},  "#Heading diff: {math.degrees(heading_diff):.1f}°, "
-                  f"Speed: {self.last_speed:.3f}, Current vel: {self.current_linear_velocity:.3f}, "
-                  f"Distance reward: {distance_reward:.3f}, heat_reward: {heat_reward:.3f}, " #Heading reward: {heading_reward:.3f}, "
-                  #f"Distance reward: {distance_reward:.3f}, Heading reward: {heading_reward:.3f}, "
-                  #f"Velocity reward: {velocity_reward:.3f}, Total reward: {reward:.3f}")
-                  f"Total reward: {reward:.3f}")
-            #print(f"yaw:{deg(yaw_r):6.1f}°, target:{deg(target_heading):6.1f}°, "
-            #      f"Δ:{deg(heading_diff):6.1f}°")
-
-
-        self.previous_distance = current_distance
-        return reward
-
     
     def get_center_heatmap_sum(self, observation: Dict[str, np.ndarray]) -> float:
         """
@@ -760,8 +686,8 @@ class RoverEnvFused(gym.Env):
             return 'pitch_forward' if self.current_pitch < 0 else 'pitch_backward'
         
         return False
+
     
-    #def reset(self, **kwargs: Any) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
     def reset(self, seed=None, options=None):
         print('################'+ self.world_name + ' Environment Reset')
         print('')
@@ -777,7 +703,14 @@ class RoverEnvFused(gym.Env):
         super().reset(seed=seed)
         x_insert = np.random.uniform(*self.rand_x_range)
         y_insert = np.random.uniform(*self.rand_y_range)
-        
+        while False: #True: # don't drop on solar panels 
+            x_insert = np.random.uniform(*self.rand_x_range)
+            y_insert = np.random.uniform(*self.rand_y_range)
+            if x_insert < -11 and (y_insert < -11 and y_insert > -19): # over solar panel
+                pass
+            else:
+                break
+            
         if self.world_name == 'inspect':
             z_insert = 6 # for inspection
             if x_insert < -24.5 and y_insert < -24.5: #inspection
@@ -850,6 +783,7 @@ class RoverEnvFused(gym.Env):
     def render(self):
         """Render the environment (optional)"""
         pass
+
 
     def close(self):
         """Clean up resources"""
