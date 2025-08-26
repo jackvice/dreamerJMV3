@@ -124,8 +124,8 @@ class RoverEnvFused(gym.Env):
         
         # Stuck detection parameters
         #self.position_history = []
-        self.stuck_threshold = 0.005   # per-step distance threshold (meters)
-        self.stuck_window = 1000        # number of consecutive steps
+        self.stuck_threshold = 0.1   # per-step distance threshold (meters)
+        self.stuck_window = 240        # number of consecutive steps
         self._stuck_count = 0
         self._last_pos_for_stuck = None
         self.stuck_penalty = -5 #-25.0
@@ -151,7 +151,7 @@ class RoverEnvFused(gym.Env):
         self.initial_orientation = None
 
         self.last_pose = None
-        
+
         # Ground truth pose
         self.current_pose = Pose()
         self.current_pose.position.x = 0.0
@@ -162,7 +162,15 @@ class RoverEnvFused(gym.Env):
         self.current_pose.orientation.z = 0.0
         self.current_pose.orientation.w = 1.0
 
+        
+        #actor pose
+        self.actor1_pose = Pose()
+        self.actor1_pose.position.x = 0.0
+        self.actor1_pose.position.y = 0.0
+        
         self.yaw_history = deque(maxlen=200)
+        # Velocity collision detection  
+        self.velocity_mismatch_history: deque = deque(maxlen=30)
         
         # Add these as class variables in your environment's __init__
         self.down_facing_training_steps = 200000  # Duration of temporary training
@@ -181,10 +189,17 @@ class RoverEnvFused(gym.Env):
             #self.rand_goal_y_range = (-26, -19) # first 500k steps, phase 1 curriculum learning
             #self.rand_x_range = (-25, -10) #x(-5.4, -1) # moon y(-9.3, -0.5) # moon,  x(-3.5, 2.5) 
             #self.rand_y_range = (-25, -19) # -27,-19 for inspection
-            self.rand_x_range = (-24, -10) # same as phase 2 goals
-            self.rand_y_range = (-22, -8) # same as phase 2 goals
-            self.rand_goal_x_range = (-24, -10) # bigger around obstacles, phase 2 curriculum
-            self.rand_goal_y_range = (-22, -8) # bigger around obstacles, phase 2 curriculum
+
+            self.rand_x_range = (-25, -10) # same as phase 2 goals
+            self.rand_y_range = (-22, -9) # a little more drop space toward the middle
+            self.rand_goal_x_range = (-25, -10) # bigger around obstacles, phase 2 curriculum
+            self.rand_goal_y_range = (-19, -11) # bigger around obstacles, phase 2 curriculum
+
+            #self.rand_x_range = (-10, 0) # map center area, lower right
+            #self.rand_y_range = (-16, -13) # map center area, lower right
+            #self.rand_goal_x_range = (-12, 3) # phase 2 curriculum, solar and pipes
+            #self.rand_goal_y_range = (-26, -18) # phase 2 solar and pipes
+            
             #self.rand_x_range = (-27, -6) #-19) #x(-5.4, -1) # moon y(-9.3, -0.5) # moon,  x(-3.5, 2.5) 
             #self.rand_y_range = (-27, -19) # -27,-19 for inspection
             self.too_far_away_low_x = -29.5 #for inspection
@@ -323,6 +338,14 @@ class RoverEnvFused(gym.Env):
             PoseArray,
             '/rover/pose_array',
             self.pose_array_callback,
+            qos_profile
+        )
+
+        # Actor Pose subscriber for reward calculation
+        self.actor1_pose_array_subscriber = self.node.create_subscription(
+            PoseArray,
+            '/linear_actor/pose',
+            self.actor1_pose_array_callback,
             qos_profile
         )
 
@@ -533,6 +556,38 @@ class RoverEnvFused(gym.Env):
         return
 
 
+    def detect_velocity_collision(self) -> float:
+        """Detect obstacle collision via velocity mismatch. Returns penalty value."""
+        # Only check when commanding meaningful forward motion
+        if self.last_speed <= 0.1:
+            return 0.0
+    
+        # Calculate current velocity mismatch
+        mismatch = abs(self.last_speed - self.current_linear_velocity)
+        self.velocity_mismatch_history.append(mismatch)
+    
+        # Calculate average mismatch over window
+        if len(self.velocity_mismatch_history) < 10:  # Need some history
+            return 0.0
+    
+        avg_mismatch = sum(self.velocity_mismatch_history) / len(self.velocity_mismatch_history)
+    
+        # Linear penalty for sustained mismatch above threshold
+        if avg_mismatch > 0.15:
+            return (avg_mismatch - 0.15) * 2.0  # Scale factor of 2.0
+    
+        return 0.0
+
+
+
+    def is_actor_close(self) -> bool:
+        """Return True if actor is within 0.5 meters of robot (2D distance)."""
+        dx = self.actor1_pose.position.x - self.current_pose.position.x
+        dy = self.actor1_pose.position.y - self.current_pose.position.y
+        distance = math.sqrt(dx * dx + dy * dy)
+        return distance < 0.5
+
+
     def task_reward(self, observation):
         """
         Comprehensive reward function that balances navigation efficiency, 
@@ -600,7 +655,16 @@ class RoverEnvFused(gym.Env):
         # Penalize spinning more when not moving forward
         spin_penalty = spin_penalty_scale * (abs(self.current_angular_velocity) *
                                        max(0.01, 0.02 - self.current_linear_velocity * 0.01))
+        if self.is_actor_close():
+            collision_penalty = 1.0
+        else:
+            collision_penalty = 0.0
+        #collision_penalty = self.detect_velocity_collision()
+        #if collision_penalty > 0.7:
+        #    print("collision with penality", -collision_penalty)
         # Combine all rewards with proper weighting
+
+        
         total_reward = (
             distance_reward +           # Primary navigation signal
             heading_reward +            # Orientation guidance  
@@ -608,6 +672,7 @@ class RoverEnvFused(gym.Env):
             heat_penalty -              # Pedestrian avoidance
             time_penalty -              # Efficiency incentive
             spin_penalty                # keep from spinning
+            #collision_penalty           # Velocity collision detection
         )
         
         # Bonus for making progress while well-aligned (multiplicative bonus)
@@ -620,7 +685,7 @@ class RoverEnvFused(gym.Env):
             if self.total_steps % 10_000 == 0:
                 save_fused_image_channels(observation['image'])
             print(f"\nPose: ({self.current_pose.position.x:.2f}, {self.current_pose.position.y:.2f}), Target: ({self.target_positions_x:.2f}, {self.target_positions_y:.2f}), Dist: {current_distance:.3f}, Δd: {distance_delta:.3f}, Heading: {math.degrees(self.current_yaw):.1f}°, HeadDiff: {math.degrees(heading_diff):.1f}°, LinVel: {self.current_linear_velocity:.3f}, AngVel: {self.current_angular_velocity:.3f}")
-            print(f"Rewards - Dist: {distance_reward:.3f}, Head: {heading_reward:.3f}, Vel: {velocity_reward:.3f}, Heat: {-heat_penalty:.3f}, Spin: {-spin_penalty:.3f}, Total: {total_reward:.3f}")
+            print(f"Rewards - Dist: {distance_reward:.3f}, Head: {heading_reward:.3f}, Vel: {velocity_reward:.3f}, Heat: {-heat_penalty:.3f}, Spin: {-spin_penalty:.3f}, Collision: {-collision_penalty:.3f}, Total: {total_reward:.3f}")
             
 
         self.previous_distance = current_distance
@@ -701,12 +766,12 @@ class RoverEnvFused(gym.Env):
         self.publisher.publish(twist)
         """Reset the environment to its initial state"""
         super().reset(seed=seed)
-        x_insert = np.random.uniform(*self.rand_x_range)
-        y_insert = np.random.uniform(*self.rand_y_range)
-        while False: #True: # don't drop on solar panels 
+        #x_insert = np.random.uniform(*self.rand_x_range)
+        #y_insert = np.random.uniform(*self.rand_y_range)
+        while True: # don't drop on solar panels 
             x_insert = np.random.uniform(*self.rand_x_range)
             y_insert = np.random.uniform(*self.rand_y_range)
-            if x_insert < -11 and (y_insert < -11 and y_insert > -19): # over solar panel
+            if x_insert < -11 and (y_insert < -11.8 and y_insert > -18.9): # over solar panel
                 pass
             else:
                 break
@@ -828,9 +893,27 @@ class RoverEnvFused(gym.Env):
                 self.current_yaw = yaw
             except Exception as e:
                 self.node.get_logger().error(f"Error processing pose orientation data: {e}")
-        
 
+
+    def actor1_pose_array_callback(self, msg):
+        """Callback for processing actor pose messages."""
+        if msg.poses:
+            self.actor1_pose = msg.poses[0]  # Direct assignment is fine
+
+    """
+    def actor1_pose_array_callback(self, msg):
+         if msg.poses:  # Check if we have any poses
+            self.actor1_last_pose = self.actor1_pose_pose if hasattr(self, 'current_pose') else None
+            self.actor1_pose = msg.poses[0]  # Take the first pose
             
+            # UPDATE - Store position as numpy array
+            self.actor1_position = np.array([
+                self.actor1_pose.position.x = 0.0
+                self.actor1_pose.position.y = 0.0
+            ], dtype=np.float32)
+                
+    """
+    
     """
     def imu_callback(self, msg):
         try:
