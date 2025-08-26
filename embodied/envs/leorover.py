@@ -8,7 +8,7 @@ import struct
 from multiprocessing import shared_memory
 
 import rclpy
-from geometry_msgs.msg import Twist, Pose, PoseArray # , Point, Quaternion
+from geometry_msgs.msg import PoseStamped, Twist, Pose, PoseArray # , Point, Quaternion
 #from sensor_msgs.msg import Imu
 from nav_msgs.msg import Odometry
 from cv_bridge import CvBridge
@@ -342,10 +342,10 @@ class RoverEnvFused(gym.Env):
         )
 
         # Actor Pose subscriber for reward calculation
-        self.actor1_pose_array_subscriber = self.node.create_subscription(
-            PoseArray,
+        self.actor1_pose_subscriber = self.node.create_subscription(
+            PoseStamped,
             '/linear_actor/pose',
-            self.actor1_pose_array_callback,
+            self.actor1_pose_callback,
             qos_profile
         )
 
@@ -598,7 +598,7 @@ class RoverEnvFused(gym.Env):
         distance_reward_scale = 1.4
         heading_reward_scale = 0.03  # Increased from 0.02
         velocity_reward_scale = 0.015  # Slightly increased
-        heatmap_penalty_scale = 0.1  # Reduced from 1.0
+        heatmap_penalty_scale = 1.0 #0.1  # Reduced from 1.0
         time_penalty_scale = 0.002  # Small penalty per step to encourage efficiency
         spin_penalty_scale = 1.3
         
@@ -655,10 +655,11 @@ class RoverEnvFused(gym.Env):
         # Penalize spinning more when not moving forward
         spin_penalty = spin_penalty_scale * (abs(self.current_angular_velocity) *
                                        max(0.01, 0.02 - self.current_linear_velocity * 0.01))
-        if self.is_actor_close():
-            collision_penalty = 1.0
-        else:
-            collision_penalty = 0.0
+        #if self.is_actor_close():
+        #    collision_penalty = 1.0
+        #    print('Robot to close to Actor')
+        #else:
+        collision_penalty = 0.0
         #collision_penalty = self.detect_velocity_collision()
         #if collision_penalty > 0.7:
         #    print("collision with penality", -collision_penalty)
@@ -671,8 +672,8 @@ class RoverEnvFused(gym.Env):
             velocity_reward -           # Movement encouragement
             heat_penalty -              # Pedestrian avoidance
             time_penalty -              # Efficiency incentive
-            spin_penalty                # keep from spinning
-            #collision_penalty           # Velocity collision detection
+            spin_penalty -              # keep from spinning
+            collision_penalty           # Velocity collision detection
         )
         
         # Bonus for making progress while well-aligned (multiplicative bonus)
@@ -895,25 +896,10 @@ class RoverEnvFused(gym.Env):
                 self.node.get_logger().error(f"Error processing pose orientation data: {e}")
 
 
-    def actor1_pose_array_callback(self, msg):
+    def actor1_pose_callback(self, msg):
         """Callback for processing actor pose messages."""
-        if msg.poses:
-            self.actor1_pose = msg.poses[0]  # Direct assignment is fine
+        self.actor1_pose = msg.pose  # Direct assignment is fine
 
-    """
-    def actor1_pose_array_callback(self, msg):
-         if msg.poses:  # Check if we have any poses
-            self.actor1_last_pose = self.actor1_pose_pose if hasattr(self, 'current_pose') else None
-            self.actor1_pose = msg.poses[0]  # Take the first pose
-            
-            # UPDATE - Store position as numpy array
-            self.actor1_position = np.array([
-                self.actor1_pose.position.x = 0.0
-                self.actor1_pose.position.y = 0.0
-            ], dtype=np.float32)
-                
-    """
-    
     """
     def imu_callback(self, msg):
         try:
