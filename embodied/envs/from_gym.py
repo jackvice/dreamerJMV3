@@ -75,6 +75,8 @@ class FromGym(embodied.Env):
       obs = {self._obs_key: obs}
     obs = self._flatten(obs)
     obs = {k: np.asarray(v) for k, v in obs.items()}
+
+    
     obs.update(
         reward=np.float32(reward),
         is_first=is_first,

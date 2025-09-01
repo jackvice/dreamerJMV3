@@ -6,7 +6,7 @@ import math
 import os
 import struct
 from multiprocessing import shared_memory
-
+import csv
 import rclpy
 from geometry_msgs.msg import PoseStamped, Twist, Pose, PoseArray # , Point, Quaternion
 #from sensor_msgs.msg import Imu
@@ -124,8 +124,8 @@ class RoverEnvFused(gym.Env):
         
         # Stuck detection parameters
         #self.position_history = []
-        self.stuck_threshold = 0.1   # per-step distance threshold (meters)
-        self.stuck_window = 240        # number of consecutive steps
+        self.stuck_threshold = 0.05   # per-step distance threshold (meters)
+        self.stuck_window = 200        # number of consecutive steps
         self._stuck_count = 0
         self._last_pos_for_stuck = None
         self.stuck_penalty = -5 #-25.0
@@ -161,12 +161,6 @@ class RoverEnvFused(gym.Env):
         self.current_pose.orientation.y = 0.0
         self.current_pose.orientation.z = 0.0
         self.current_pose.orientation.w = 1.0
-
-        
-        #actor pose
-        self.actor1_pose = Pose()
-        self.actor1_pose.position.x = 0.0
-        self.actor1_pose.position.y = 0.0
         
         self.yaw_history = deque(maxlen=200)
         # Velocity collision detection  
@@ -180,9 +174,22 @@ class RoverEnvFused(gym.Env):
         self.target_positions_y = 0
         self.previous_distance = None
 
+        # --- in __init__ (after self.total_steps etc.) ---
+        self._csv_path = f"logdir/reward_log_{datetime.now().strftime('%m_%d_%H-%M')}.csv"
+        self._csv_file = open(self._csv_path, mode="w", newline="")
+        self._csv_writer = csv.writer(self._csv_file)
+        self._csv_writer.writerow([
+            "step","time_s","rx","ry","tx","ty","dist","delta_d",
+            "yaw_deg","head_diff_deg","lin_vel","ang_vel",
+            "r_dist","r_head","r_vel","p_heat","p_spin","p_time","p_close",
+            "align_bonus","total_reward"
+        ])
+        self._csv_file.flush()
+
+        
         self.world_pose_path = '/world/' + self.world_name + '/set_pose'
         print('world is', self.world_name)
-
+        
         if self.world_name == 'inspect':
             # Navigation parameters previous
             #self.rand_goal_x_range = (-26, -19) # first 500k steps, phase 1 curriculum learning
@@ -190,11 +197,17 @@ class RoverEnvFused(gym.Env):
             #self.rand_x_range = (-25, -10) #x(-5.4, -1) # moon y(-9.3, -0.5) # moon,  x(-3.5, 2.5) 
             #self.rand_y_range = (-25, -19) # -27,-19 for inspection
 
-            self.rand_x_range = (-25, -10) # same as phase 2 goals
-            self.rand_y_range = (-22, -9) # a little more drop space toward the middle
-            self.rand_goal_x_range = (-25, -10) # bigger around obstacles, phase 2 curriculum
-            self.rand_goal_y_range = (-19, -11) # bigger around obstacles, phase 2 curriculum
+            self.rand_x_range = (-27, -12) # actor area 
+            self.rand_y_range = (-25, -17) #  actor area 
+            self.rand_goal_x_range = (-27, -14) # actor area 
+            self.rand_goal_y_range = (-25, -18) # actor area 
 
+            #self.rand_x_range = (-6, 6) # same as phase 2 goals
+            #self.rand_y_range = (-6, 6) # a little more drop space toward the middle
+            #self.rand_goal_x_range = (-10, 10) # bigger around obstacles, phase 2 curriculum
+            #self.rand_goal_y_range = (-10, 10) # bigger around obstacles, phase 2 curriculum
+            
+            
             #self.rand_x_range = (-10, 0) # map center area, lower right
             #self.rand_y_range = (-16, -13) # map center area, lower right
             #self.rand_goal_x_range = (-12, 3) # phase 2 curriculum, solar and pipes
@@ -242,11 +255,11 @@ class RoverEnvFused(gym.Env):
         
         # Speed levels (m/s)
         self.speed_levels = np.array([
-            -0.2,   # reverse slow  
+            -0.3, #-0.2,   # reverse slow  
             0.0,    # stop (important for obstacles)
-            0.3,    # slow forward
-            0.6,    # medium forward
-            1.0     # fast forward
+            0.1, #0.3,    # slow forward
+            0.25, #0.6,    # medium forward
+            0.4, #1.0     # fast forward
         ], dtype=np.float32)
         
         # Direction angles (radians) - full 360° coverage
@@ -341,14 +354,7 @@ class RoverEnvFused(gym.Env):
             qos_profile
         )
 
-        # Actor Pose subscriber for reward calculation
-        self.actor1_pose_subscriber = self.node.create_subscription(
-            PoseStamped,
-            '/linear_actor/pose',
-            self.actor1_pose_callback,
-            qos_profile
-        )
-
+        
         # Keep odometry subscriber for reward calculation
         self.odom_subscriber = self.node.create_subscription(
             Odometry,
@@ -357,6 +363,56 @@ class RoverEnvFused(gym.Env):
             10)
 
 
+        #actor pose
+        self.actor1_xy: tuple[float, float] | None = None
+        self.actor1_pose_subscriber = self.node.create_subscription(
+            Pose,
+            '/linear_actor/pose',
+            self.actor1_pose_callback,
+            qos_profile
+        )
+        
+        self.actor2_xy: tuple[float, float] | None = None
+        self.actor2_pose_subscriber = self.node.create_subscription(
+            Pose,
+            '/triangle_actor/pose',
+            self.actor2_pose_callback,
+            qos_profile
+        )
+
+
+    def actor1_pose_callback(self, msg: Pose) -> None:
+        """Store only the actor's (x, y) from geometry_msgs/Pose."""
+        self.actor1_xy = (msg.position.x, msg.position.y)
+
+
+    def actor2_pose_callback(self, msg: Pose) -> None:
+        """Store only the actor's (x, y) from geometry_msgs/Pose."""
+        self.actor2_xy = (msg.position.x, msg.position.y)
+
+    
+    def is_actor1_close(self, radius: float = 0.8) -> bool:
+        """Return True if actor is within radius (meters) of robot in 2D."""
+        if self.actor1_xy is None:
+            return False
+        rx = self.current_pose.position.x
+        ry = self.current_pose.position.y
+        dx = self.actor1_xy[0] - rx
+        dy = self.actor1_xy[1] - ry
+        return (dx * dx + dy * dy) < (radius * radius)
+    
+
+    def is_actor2_close(self, radius: float = 0.8) -> bool:
+        """Return True if actor is within radius (meters) of robot in 2D."""
+        if self.actor2_xy is None:
+            return False
+        rx = self.current_pose.position.x
+        ry = self.current_pose.position.y
+        dx = self.actor2_xy[0] - rx
+        dy = self.actor2_xy[1] - ry
+        return (dx * dx + dy * dy) < (radius * radius)
+
+        
     def get_fused_observation(self) -> np.ndarray:
         """Block until a new frame arrives, then return the fused observation from shared memory."""
         buf = self.rl_obs_shm.buf
@@ -400,7 +456,7 @@ class RoverEnvFused(gym.Env):
         return {
 
             'image': self.get_fused_observation(),
-            'pose': self.rover_position, #why is this in the observation?
+            'pose': np.array([0.0, 0.0, 0.0],dtype=np.float32), # don't memorize, self.rover_position, why is this in obs?
             'imu': np.array([self.current_pitch, self.current_roll, self.current_yaw],
                             dtype=np.float32),
             'target': self.get_target_info(),
@@ -535,7 +591,6 @@ class RoverEnvFused(gym.Env):
                                             'reward': reward}
 
         
-
     def update_target_pos(self):
         print('###################################################### GOAL ACHIVED!')
 
@@ -579,15 +634,6 @@ class RoverEnvFused(gym.Env):
         return 0.0
 
 
-
-    def is_actor_close(self) -> bool:
-        """Return True if actor is within 0.5 meters of robot (2D distance)."""
-        dx = self.actor1_pose.position.x - self.current_pose.position.x
-        dy = self.actor1_pose.position.y - self.current_pose.position.y
-        distance = math.sqrt(dx * dx + dy * dy)
-        return distance < 0.5
-
-
     def task_reward(self, observation):
         """
         Comprehensive reward function that balances navigation efficiency, 
@@ -599,8 +645,9 @@ class RoverEnvFused(gym.Env):
         heading_reward_scale = 0.03  # Increased from 0.02
         velocity_reward_scale = 0.015  # Slightly increased
         heatmap_penalty_scale = 1.0 #0.1  # Reduced from 1.0
-        time_penalty_scale = 0.002  # Small penalty per step to encourage efficiency
-        spin_penalty_scale = 1.3
+        time_penalty_scale = 0.008  # Small penalty per step to encourage efficiency
+        spin_penalty_scale = 1.8
+        collision_penalty_val = 22
         
         # Get current state info
         distance_heading_info = self.get_target_info()
@@ -648,6 +695,8 @@ class RoverEnvFused(gym.Env):
         # Pedestrian avoidance penalty (reduced impact)
         heatmap_center = self.get_center_heatmap_sum(observation)
         heat_penalty = heatmap_center * heatmap_penalty_scale
+        #if heat_penalty < 0.25:
+        #    heat_penalty = heat_penalty / 2.0
         
         # Time efficiency penalty (small constant penalty to encourage faster completion)
         time_penalty = time_penalty_scale
@@ -655,11 +704,16 @@ class RoverEnvFused(gym.Env):
         # Penalize spinning more when not moving forward
         spin_penalty = spin_penalty_scale * (abs(self.current_angular_velocity) *
                                        max(0.01, 0.02 - self.current_linear_velocity * 0.01))
-        #if self.is_actor_close():
-        #    collision_penalty = 1.0
-        #    print('Robot to close to Actor')
-        #else:
-        collision_penalty = 0.0
+        
+        if self.is_actor1_close() or self.is_actor2_close():
+            collision_penalty = collision_penalty_val
+            if self.total_steps % 50 == 0:
+                print('Robot to close to Actor')
+            if False: # self.total_steps % 10 == 0:
+                save_fused_image_channels(observation['image'])
+        else:
+            collision_penalty = 0.0
+            
         #collision_penalty = self.detect_velocity_collision()
         #if collision_penalty > 0.7:
         #    print("collision with penality", -collision_penalty)
@@ -670,24 +724,48 @@ class RoverEnvFused(gym.Env):
             distance_reward +           # Primary navigation signal
             heading_reward +            # Orientation guidance  
             velocity_reward -           # Movement encouragement
-            heat_penalty -              # Pedestrian avoidance
+            #heat_penalty -              # Pedestrian avoidance
             time_penalty -              # Efficiency incentive
             spin_penalty -              # keep from spinning
             collision_penalty           # Velocity collision detection
         )
         
         # Bonus for making progress while well-aligned (multiplicative bonus)
+        alignment_bonus = 0.0
         if distance_delta > 0 and abs_heading_diff < math.pi/4:  # 45 degrees
             alignment_bonus = distance_delta * 0.3
             total_reward += alignment_bonus
-
+            
 
         if self.total_steps % 2_000 == 0:
-            if self.total_steps % 10_000 == 0:
+            if False: #self.total_steps % 10_000 == 0:
                 save_fused_image_channels(observation['image'])
-            print(f"\nPose: ({self.current_pose.position.x:.2f}, {self.current_pose.position.y:.2f}), Target: ({self.target_positions_x:.2f}, {self.target_positions_y:.2f}), Dist: {current_distance:.3f}, Δd: {distance_delta:.3f}, Heading: {math.degrees(self.current_yaw):.1f}°, HeadDiff: {math.degrees(heading_diff):.1f}°, LinVel: {self.current_linear_velocity:.3f}, AngVel: {self.current_angular_velocity:.3f}")
-            print(f"Rewards - Dist: {distance_reward:.3f}, Head: {heading_reward:.3f}, Vel: {velocity_reward:.3f}, Heat: {-heat_penalty:.3f}, Spin: {-spin_penalty:.3f}, Collision: {-collision_penalty:.3f}, Total: {total_reward:.3f}")
+            # print (as you had)
+            print(f"\nPose: ({self.current_pose.position.x:.2f}, {self.current_pose.position.y:.2f}), "
+                  f"Target: ({self.target_positions_x:.2f}, {self.target_positions_y:.2f}), "
+                  f"Dist: {current_distance:.3f}, Δd: {distance_delta:.3f}, "
+                  f"Heading: {math.degrees(self.current_yaw):.1f}°, "
+                  f"HeadDiff: {math.degrees(heading_diff):.1f}°, "
+                  f"LinVel: {self.current_linear_velocity:.3f}, AngVel: {self.current_angular_velocity:.3f}")
+            print(f"Rewards - Dist: {distance_reward:.3f}, Head: {heading_reward:.3f}, Vel: {velocity_reward:.3f}, "
+                  f"Heat: {-heat_penalty:.3f}, Spin: {-spin_penalty:.3f}, "
+                  f"Collision: {-collision_penalty:.3f}, Total: {total_reward:.3f}")
             
+        if self.total_steps % 1_000 == 0:
+            # csv row
+            self._csv_writer.writerow([
+                int(self.total_steps),
+                float(self.sim_time) if hasattr(self, "sim_time") else 0.0,
+                float(self.current_pose.position.x), float(self.current_pose.position.y),
+                float(self.target_positions_x), float(self.target_positions_y),
+                float(current_distance), float(distance_delta),
+                float(math.degrees(self.current_yaw)), float(math.degrees(heading_diff)),
+                float(self.current_linear_velocity), float(self.current_angular_velocity),
+                float(distance_reward), float(heading_reward), float(velocity_reward),
+                float(heat_penalty), float(spin_penalty), float(time_penalty), float(collision_penalty),
+                float(alignment_bonus), float(total_reward)
+            ])
+            self._csv_file.flush()
 
         self.previous_distance = current_distance
         return total_reward    
@@ -713,8 +791,7 @@ class RoverEnvFused(gym.Env):
 
         return float(np.expm1(k * x) / np.expm1(k))
 
-    
-    
+        
     def get_target_info(self):
         """Calculate distance and azimuth to current target"""
         if self.current_pose is None:
@@ -896,9 +973,6 @@ class RoverEnvFused(gym.Env):
                 self.node.get_logger().error(f"Error processing pose orientation data: {e}")
 
 
-    def actor1_pose_callback(self, msg):
-        """Callback for processing actor pose messages."""
-        self.actor1_pose = msg.pose  # Direct assignment is fine
 
     """
     def imu_callback(self, msg):

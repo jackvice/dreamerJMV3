@@ -38,13 +38,13 @@ defaults:
     leorover: {size: [96, 96]}
 
   replay:
-    size: 5e6
+    size: 500_000 #5e6
     online: True
     fracs: {uniform: 1.0, priority: 0.0, recency: 0.0}
     prio: {exponent: 0.8, maxfrac: 0.5, initial: inf, zero_on_sample: True}
     priosignal: model
     recexp: 1.0
-    chunksize: 1024
+    chunksize: 512 #1024
 
   run:
     steps: 1e10
@@ -157,7 +157,7 @@ size400m: &size400m
 leorover:
   <<: *size50m
   task: leorover_navigation
-  run: {steps: 4e6, train_ratio: 96, envs: 1}
+  run: {steps: 7e6, train_ratio: 96, envs: 1}
   
 minecraft:
   task: minecraft_diamond

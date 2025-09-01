@@ -2,6 +2,7 @@
 dist
 __pycache__/
 out_images/
+logdir/
 *.py[cod]
 *.egg-info
 MUJOCO_LOG.TXT
