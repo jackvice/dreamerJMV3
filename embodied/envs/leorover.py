@@ -18,13 +18,12 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 #from gazebo_msgs.srv import SetEntityState
 #from sensor_msgs.msg import Image
 from std_msgs.msg import String
-
 from transforms3d.euler import quat2euler
 from gym import spaces
 import cv2
 from collections import deque
 from time import strftime
-from typing import Dict #Optional,
+from typing import Dict, Optional
 import numpy.typing as npt
 from datetime import datetime
 from time import perf_counter
@@ -161,8 +160,15 @@ class RoverEnvFused(gym.Env):
         self.current_pose.orientation.y = 0.0
         self.current_pose.orientation.z = 0.0
         self.current_pose.orientation.w = 1.0
-        
+
         self.yaw_history = deque(maxlen=200)
+
+        self.pose_lidar_1 = 0
+        self.pose_lidar_2 = 0
+        self.pose_lidar_3 = 0
+
+        self.steps_run_time = 0
+        self.heat_reward_total = 0        
         # Velocity collision detection  
         self.velocity_mismatch_history: deque = deque(maxlen=30)
         
@@ -197,10 +203,10 @@ class RoverEnvFused(gym.Env):
             #self.rand_x_range = (-25, -10) #x(-5.4, -1) # moon y(-9.3, -0.5) # moon,  x(-3.5, 2.5) 
             #self.rand_y_range = (-25, -19) # -27,-19 for inspection
 
-            self.rand_x_range = (-27, -12) # actor area 
-            self.rand_y_range = (-25, -17) #  actor area 
-            self.rand_goal_x_range = (-27, -14) # actor area 
-            self.rand_goal_y_range = (-25, -18) # actor area 
+            self.rand_x_range = (-27, -12) # actor area (-27, -12) # actor area 
+            self.rand_y_range = (-25, -19) #  actor area (-25, -1) #  actor area 
+            self.rand_goal_x_range = (-27, -14) # actor area test values (-27, -14)  
+            self.rand_goal_y_range = (-25, -18) # actor area test values (-25, -18) 
 
             #self.rand_x_range = (-6, 6) # same as phase 2 goals
             #self.rand_y_range = (-6, 6) # a little more drop space toward the middle
@@ -255,11 +261,11 @@ class RoverEnvFused(gym.Env):
         
         # Speed levels (m/s)
         self.speed_levels = np.array([
-            -0.3, #-0.2,   # reverse slow  
+            -0.5, #-0.2,   # reverse slow  
             0.0,    # stop (important for obstacles)
-            0.1, #0.3,    # slow forward
-            0.25, #0.6,    # medium forward
-            0.4, #1.0     # fast forward
+            0.3, #0.3,    # slow forward
+            0.4, #0.6,    # medium forward
+            0.8, #1.0     # fast forward
         ], dtype=np.float32)
         
         # Direction angles (radians) - full 360° coverage
@@ -379,6 +385,14 @@ class RoverEnvFused(gym.Env):
             self.actor2_pose_callback,
             qos_profile
         )
+        
+        """
+        self.lidar_subscriber = self.node.create_subscription(
+            LaserScan,
+            scan_topic,
+            self.lidar_callback,
+            10)
+        """
 
 
     def actor1_pose_callback(self, msg: Pose) -> None:
@@ -400,7 +414,28 @@ class RoverEnvFused(gym.Env):
         dx = self.actor1_xy[0] - rx
         dy = self.actor1_xy[1] - ry
         return (dx * dx + dy * dy) < (radius * radius)
+
+
+    def actor1_distance_xy(self) -> Optional[float]:
+        """Return 2D distance (meters) from robot to actor1 in the same world frame."""
+        if self.actor1_xy is None:
+            return None
+        rx = float(self.current_pose.position.x)
+        ry = float(self.current_pose.position.y)
+        
+        ax, ay = float(self.actor1_xy[0]), float(self.actor1_xy[1])
+        return math.hypot(ax - rx, ay - ry)
     
+
+    def actor2_distance_xy(self) -> Optional[float]:
+        """Return 2D distance (meters) from robot to actor1 in the same world frame."""
+        if self.actor2_xy is None:
+            return None
+        rx = float(self.current_pose.position.x)
+        ry = float(self.current_pose.position.y)
+        ax, ay = float(self.actor2_xy[0]), float(self.actor2_xy[1])
+        return math.hypot(ax - rx, ay - ry)
+
 
     def is_actor2_close(self, radius: float = 0.8) -> bool:
         """Return True if actor is within radius (meters) of robot in 2D."""
@@ -456,7 +491,8 @@ class RoverEnvFused(gym.Env):
         return {
 
             'image': self.get_fused_observation(),
-            'pose': np.array([0.0, 0.0, 0.0],dtype=np.float32), # don't memorize, self.rover_position, why is this in obs?
+            'pose': np.array([self.pose_lidar_1, self.pose_lidar_2, self.pose_lidar_3],dtype=np.float32), 
+            
             'imu': np.array([self.current_pitch, self.current_roll, self.current_yaw],
                             dtype=np.float32),
             'target': self.get_target_info(),
@@ -611,29 +647,6 @@ class RoverEnvFused(gym.Env):
         return
 
 
-    def detect_velocity_collision(self) -> float:
-        """Detect obstacle collision via velocity mismatch. Returns penalty value."""
-        # Only check when commanding meaningful forward motion
-        if self.last_speed <= 0.1:
-            return 0.0
-    
-        # Calculate current velocity mismatch
-        mismatch = abs(self.last_speed - self.current_linear_velocity)
-        self.velocity_mismatch_history.append(mismatch)
-    
-        # Calculate average mismatch over window
-        if len(self.velocity_mismatch_history) < 10:  # Need some history
-            return 0.0
-    
-        avg_mismatch = sum(self.velocity_mismatch_history) / len(self.velocity_mismatch_history)
-    
-        # Linear penalty for sustained mismatch above threshold
-        if avg_mismatch > 0.15:
-            return (avg_mismatch - 0.15) * 2.0  # Scale factor of 2.0
-    
-        return 0.0
-
-
     def task_reward(self, observation):
         """
         Comprehensive reward function that balances navigation efficiency, 
@@ -641,13 +654,14 @@ class RoverEnvFused(gym.Env):
         """
         # Constants
         success_distance = 0.3
-        distance_reward_scale = 1.4
+        distance_reward_scale = 4
         heading_reward_scale = 0.03  # Increased from 0.02
         velocity_reward_scale = 0.015  # Slightly increased
         heatmap_penalty_scale = 1.0 #0.1  # Reduced from 1.0
         time_penalty_scale = 0.008  # Small penalty per step to encourage efficiency
         spin_penalty_scale = 1.8
-        collision_penalty_val = 22
+        heat_reward = 0.0
+
         
         # Get current state info
         distance_heading_info = self.get_target_info()
@@ -669,8 +683,6 @@ class RoverEnvFused(gym.Env):
         distance_reward = distance_delta * distance_reward_scale
         
         # Heading alignment reward
-        # Convert heading difference to range [-π, π]
-        #heading_diff = math.atan2(math.sin(heading_diff), math.cos(heading_diff))
         abs_heading_diff = abs(heading_diff)
         
         if abs_heading_diff <= math.pi/2:
@@ -683,7 +695,7 @@ class RoverEnvFused(gym.Env):
         heading_reward = heading_alignment * heading_reward_scale
         
         # Velocity reward - encourage forward movement, penalize excessive speed
-        optimal_speed = 0.7  # Target speed in m/s
+        optimal_speed = 0.4  # Target speed in m/s
         speed_diff = abs(self.current_linear_velocity - optimal_speed)
         if self.current_linear_velocity > 0:
             # Reward forward movement, with bonus for optimal speed
@@ -692,34 +704,52 @@ class RoverEnvFused(gym.Env):
             # Penalty for not moving forward
             velocity_reward = self.current_linear_velocity * velocity_reward_scale * 2
         
-        # Pedestrian avoidance penalty (reduced impact)
-        heatmap_center = self.get_center_heatmap_sum(observation)
-        heat_penalty = heatmap_center * heatmap_penalty_scale
-        #if heat_penalty < 0.25:
-        #    heat_penalty = heat_penalty / 2.0
-        
-        # Time efficiency penalty (small constant penalty to encourage faster completion)
+        heat_penalty = 0.0
         time_penalty = time_penalty_scale
-        
         # Penalize spinning more when not moving forward
         spin_penalty = spin_penalty_scale * (abs(self.current_angular_velocity) *
                                        max(0.01, 0.02 - self.current_linear_velocity * 0.01))
+        actor1_distance = self.actor1_distance_xy()
+        actor2_distance = self.actor2_distance_xy()
+        collision_penalty = 0.0
         
-        if self.is_actor1_close() or self.is_actor2_close():
-            collision_penalty = collision_penalty_val
-            if self.total_steps % 50 == 0:
-                print('Robot to close to Actor')
-            if False: # self.total_steps % 10 == 0:
-                save_fused_image_channels(observation['image'])
-        else:
-            collision_penalty = 0.0
-            
-        #collision_penalty = self.detect_velocity_collision()
-        #if collision_penalty > 0.7:
-        #    print("collision with penality", -collision_penalty)
-        # Combine all rewards with proper weighting
+        if actor1_distance is not None:
+            if actor1_distance < 0.5:
+                collision_penalty += 15.0  # Critical zone
+            elif actor1_distance < 0.8:
+                collision_penalty += 5.0  # Warning zone  
+            elif actor1_distance < 1.2:
+                collision_penalty += 2.0  # Awareness zone
 
+        # Same structure for actor2
+        if actor2_distance is not None:
+            if actor2_distance < 0.5:
+                collision_penalty += 15.0
+            elif actor2_distance < 0.8:
+                collision_penalty += 5.0
+            elif actor2_distance < 1.2:
+                collision_penalty += 2.0
+
+        #heatmap_sum = self.get_center_heatmap_sum(observation)
+                
+        if self.total_steps % 10 == 0 and collision_penalty >= 10:
+            print('Robot to close to Actor with act1 and act2 distances of', round(actor1_distance,2),
+                  round(actor2_distance,2))
+
+        # replace your heatmap block with this tiny gate (2 s at 15 Hz = 30 steps)
+        heatmap_sum = self.get_center_heatmap_sum(observation)
+        if not hasattr(self, "next_heat_reward_step"): self.next_heat_reward_step = 0
+        if heatmap_sum > 0.0 and self.total_steps >= self.next_heat_reward_step and collision_penalty <= 2.0:
+            self.steps_run_time += 1
+            heat_mult = 60.0 + (40.0 / (1.0 + (self.steps_run_time / 10_000.0)) ) 
+            heat_reward = heatmap_sum * heat_mult
+            self.heat_reward_total += heat_reward
+
+            print('################## multiplier', heat_mult, 'heat_reward', heat_reward,
+                  ',  mean',  self.heat_reward_total /self.steps_run_time)
+            self.next_heat_reward_step = self.total_steps + 30
         
+        # Combine all rewards with proper weighting
         total_reward = (
             distance_reward +           # Primary navigation signal
             heading_reward +            # Orientation guidance  
@@ -727,7 +757,8 @@ class RoverEnvFused(gym.Env):
             #heat_penalty -              # Pedestrian avoidance
             time_penalty -              # Efficiency incentive
             spin_penalty -              # keep from spinning
-            collision_penalty           # Velocity collision detection
+            collision_penalty +           # Velocity col
+            heat_reward
         )
         
         # Bonus for making progress while well-aligned (multiplicative bonus)
@@ -735,6 +766,7 @@ class RoverEnvFused(gym.Env):
         if distance_delta > 0 and abs_heading_diff < math.pi/4:  # 45 degrees
             alignment_bonus = distance_delta * 0.3
             total_reward += alignment_bonus
+
             
 
         if self.total_steps % 2_000 == 0:
@@ -748,9 +780,12 @@ class RoverEnvFused(gym.Env):
                   f"HeadDiff: {math.degrees(heading_diff):.1f}°, "
                   f"LinVel: {self.current_linear_velocity:.3f}, AngVel: {self.current_angular_velocity:.3f}")
             print(f"Rewards - Dist: {distance_reward:.3f}, Head: {heading_reward:.3f}, Vel: {velocity_reward:.3f}, "
-                  f"Heat: {-heat_penalty:.3f}, Spin: {-spin_penalty:.3f}, "
+                  f"Heat_reard: {heat_reward:.3f}, Spin: {-spin_penalty:.3f}, "
                   f"Collision: {-collision_penalty:.3f}, Total: {total_reward:.3f}")
-            
+
+
+
+        """            
         if self.total_steps % 1_000 == 0:
             # csv row
             self._csv_writer.writerow([
@@ -766,11 +801,25 @@ class RoverEnvFused(gym.Env):
                 float(alignment_bonus), float(total_reward)
             ])
             self._csv_file.flush()
-
+        """
         self.previous_distance = current_distance
         return total_reward    
     
-    
+
+    def get_heatmap_sum(self, observation: Dict[str, np.ndarray]) -> float:
+        """
+        Count non-zero heatmap pixels.
+        
+        Returns:
+        float: Count of non-zero pixels (returned as float to keep downstream logic unchanged).
+        """
+        fused_image = observation['image']          # [96, 96, 3], uint8 in [0, 255]
+        heatmap_channel = fused_image[:, :, 1]      # channel 1 is the heatmap
+        nonzero_count = int(np.count_nonzero(heatmap_channel))
+
+        return float(nonzero_count)
+
+
     def get_center_heatmap_sum(self, observation: Dict[str, np.ndarray]) -> float:
         """
         Count non-zero heatmap pixels in the center 4 columns (46,47,48,49).
@@ -790,7 +839,7 @@ class RoverEnvFused(gym.Env):
         k = 3.0  # 0.2~close to linear; 0.5~mildly convex; 2.0~convex; 3.0~exponential
 
         return float(np.expm1(k * x) / np.expm1(k))
-
+    
         
     def get_target_info(self):
         """Calculate distance and azimuth to current target"""
@@ -972,8 +1021,112 @@ class RoverEnvFused(gym.Env):
             except Exception as e:
                 self.node.get_logger().error(f"Error processing pose orientation data: {e}")
 
+                
+    def lidar_callback(self, msg):
+        # Convert to numpy array
+        try:
+            lidar_data = np.array(msg.ranges, dtype=np.float32)
+        except Exception as e:
+            print(f"Error converting LIDAR data to numpy array: {e}")
+            return
 
+        # Replace inf/NaN/negatives
+        lidar_data[np.isinf(lidar_data)] = self.max_lidar_range
+        lidar_data[np.isnan(lidar_data)] = self.max_lidar_range
+        lidar_data = np.clip(lidar_data, 0, self.max_lidar_range)
 
+        # Downsample
+        segment_size = len(lidar_data) // self.lidar_points
+        if segment_size == 0:
+            return
+        reshaped_data = lidar_data[:segment_size * self.lidar_points].reshape(self.lidar_points, segment_size)
+        self.lidar_data = np.min(reshaped_data, axis=1)
+
+        # Angles for each downsampled bin
+        angles = np.linspace(0, 2 * np.pi, self.lidar_points, endpoint=False)
+
+        # Helper to select min distance in an angular window
+        def min_in_sector(start_deg, end_deg):
+            start_rad = np.deg2rad(start_deg)
+            end_rad   = np.deg2rad(end_deg)
+            mask = (angles >= start_rad) & (angles < end_rad)
+            if not np.any(mask):
+                return self.max_lidar_range
+            return float(np.min(self.lidar_data[mask]))
+
+        # Assign your three sectors
+        self.pose_lidar_1 = min_in_sector(30, 130)
+        self.pose_lidar_2 = min_in_sector(130, 230)
+        self.pose_lidar_3 = min_in_sector(230, 330)
+
+        self._received_scan = True
+
+                
+    def lidar_callback_old(self, msg):
+        # Process LIDAR data with error checking and downsampling.
+
+        # Convert to numpy array
+        try:
+            lidar_data = np.array(msg.ranges, dtype=np.float32)
+        except Exception as e:
+            print(f"Error converting LIDAR data to numpy array: {e}")
+            return
+
+            
+        if np.any(np.isnan(lidar_data)):
+            print(f"WARNING: Found {np.sum(np.isnan(lidar_data))} NaN values")
+            
+
+        # Replace inf values with max_lidar_range
+        inf_mask = np.isinf(lidar_data)
+        if np.any(inf_mask):
+            #print(f"INFO: Replaced {np.sum(inf_mask)} infinity values with max_lidar_range")
+            lidar_data[inf_mask] = self.max_lidar_range
+
+        # Replace any remaining invalid values (NaN, negative) with max_range
+        invalid_mask = np.logical_or(np.isnan(lidar_data), lidar_data < 0)
+        if np.any(invalid_mask):
+            print(f"INFO: Replaced {np.sum(invalid_mask)} invalid values with max_lidar_range")
+            lidar_data[invalid_mask] = self.max_lidar_range
+
+        # Clip values to valid range
+        lidar_data = np.clip(lidar_data, 0, self.max_lidar_range)
+
+        # Verify we have enough data points for downsampling
+        expected_points = self.lidar_points * (len(lidar_data) // self.lidar_points)
+        if expected_points == 0:
+            print(f"ERROR: Not enough LIDAR points for downsampling. Got {len(lidar_data)} points")
+            return
+
+        # Downsample by taking minimum value in each segment
+        try:
+            segment_size = len(lidar_data) // self.lidar_points
+            reshaped_data = lidar_data[:segment_size * self.lidar_points].reshape(self.lidar_points,
+                                                                                  segment_size)
+            self.lidar_data = np.min(reshaped_data, axis=1)
+            
+            # Verify downsampled data
+            if len(self.lidar_data) != self.lidar_points:
+                print(f"ERROR: Downsampled has wrong size. Expected {self.lidar_points}, got {len(self.lidar_data)}")
+                return
+                
+            if np.any(np.isnan(self.lidar_data)) or np.any(np.isinf(self.lidar_data)):
+                print("ERROR: Downsampled data contains invalid values")
+                print("NaN count:", np.sum(np.isnan(self.lidar_data)))
+                print("Inf count:", np.sum(np.isinf(self.lidar_data)))
+                return
+                
+        except Exception as e:
+            print(f"Error during downsampling: {e}")
+            return
+
+        #self.pose_lidar_1 =   # closest point between 30 and 130 degrees
+        #self.pose_lidar_2 =   # closest point between 130 and 230 degrees
+        #self.pose_lidar_3 =   # closest point between 230 and 330 degrees
+
+        self._received_scan = True
+
+    
     """
     def imu_callback(self, msg):
         try:
