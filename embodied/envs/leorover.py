@@ -10,6 +10,7 @@ import csv
 import rclpy
 from geometry_msgs.msg import PoseStamped, Twist, Pose, PoseArray # , Point, Quaternion
 #from sensor_msgs.msg import Imu
+from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
 from cv_bridge import CvBridge
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -28,6 +29,15 @@ import numpy.typing as npt
 from datetime import datetime
 from time import perf_counter
 from gym.envs.registration import register
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+
+scan_qos = QoSProfile(
+    reliability=ReliabilityPolicy.BEST_EFFORT,  # don't demand reliability
+    history=HistoryPolicy.KEEP_LAST,            # just keep the latest samples
+    depth=1                                     # queue of 1 is enough
+)
+
+
 
 
 # Type definitions
@@ -120,6 +130,10 @@ class RoverEnvFused(gym.Env):
         self.current_yaw = 0.0
         self.rover_position = (0, 0, 0)
         self.min_raw_lidar = 100
+        
+        self.collision_last = False
+        self.total_collision = 0
+
         
         # Stuck detection parameters
         #self.position_history = []
@@ -246,7 +260,7 @@ class RoverEnvFused(gym.Env):
             self.too_far_away_high_y = 30  # 29 for inspection
         self.too_far_away_penilty = -10 # -25.0
         #self.goal_reward = 100.0 # phase 1
-        self.goal_reward = 125.0  # phase 2
+        self.goal_reward = 100.0  # phase 2
         
         self.last_time = time.time()
         # Add at the end of your existing __init__ 
@@ -263,9 +277,9 @@ class RoverEnvFused(gym.Env):
         self.speed_levels = np.array([
             -0.5, #-0.2,   # reverse slow  
             0.0,    # stop (important for obstacles)
-            0.3, #0.3,    # slow forward
-            0.4, #0.6,    # medium forward
-            0.8, #1.0     # fast forward
+            0.2, #0.3,    # slow forward
+            0.35, #0.6,    # medium forward
+            0.7, #1.0     # fast forward
         ], dtype=np.float32)
         
         # Direction angles (radians) - full 360° coverage
@@ -338,14 +352,7 @@ class RoverEnvFused(gym.Env):
 
         # Add this line after the existing cmd_vel publisher
         self.event_publisher = self.node.create_publisher(String, '/robot/events', 10)
-        """
-        # Keep IMU subscriber for reward calculation  
-        self.imu_subscriber = self.node.create_subscription(
-            Imu,
-            imu_topic,
-            self.imu_callback,
-            10)
-        """
+
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
@@ -385,15 +392,185 @@ class RoverEnvFused(gym.Env):
             self.actor2_pose_callback,
             qos_profile
         )
+
+        self.actor3_xy: tuple[float, float] | None = None
+        self.actor3_pose_subscriber = self.node.create_subscription(
+            Pose,
+            '/diag_actor/pose',
+            self.actor3_pose_callback,
+            qos_profile
+        )
         
-        """
         self.lidar_subscriber = self.node.create_subscription(
             LaserScan,
             scan_topic,
             self.lidar_callback,
-            10)
-        """
+            scan_qos
+        )
+        
 
+    def task_reward(self, observation):
+        # Constants
+        success_distance = 0.3
+        distance_reward_scale = 2
+        heading_reward_scale = 0.03  # Increased from 0.02
+        velocity_reward_scale = 0.015  # Slightly increased
+        time_penalty_scale = 0.008  # Small penalty per step to encourage efficiency
+        spin_penalty_scale = 1.8
+
+
+        # Get current state info
+        distance_heading_info = self.get_target_info()
+        current_distance = distance_heading_info[0]
+        heading_diff = distance_heading_info[1]
+
+        # Initialize previous distance if needed
+        if self.previous_distance is None:
+            self.previous_distance = current_distance
+            return 0.0
+        
+        # Check for goal achievement
+        if current_distance < success_distance:
+            self.update_target_pos()
+            return self.goal_reward
+        
+        # Distance progress reward (positive when getting closer)
+        distance_delta = self.previous_distance - current_distance
+        distance_reward = distance_delta * distance_reward_scale
+        
+        # Heading alignment reward
+        abs_heading_diff = abs(heading_diff)
+        
+        if abs_heading_diff <= math.pi/2:
+            # From 0 to 90 degrees: scale from 1 to 0
+            heading_alignment = 1.0 - (2 * abs_heading_diff / math.pi)
+        else:
+            # From 90 to 180 degrees: scale from 0 to -1
+            heading_alignment = -2 * (abs_heading_diff - math.pi/2) / math.pi
+        
+        heading_reward = heading_alignment * heading_reward_scale
+        
+        # Velocity reward - encourage forward movement, penalize excessive speed
+        optimal_speed = 0.7  # Target speed in m/s
+        speed_diff = abs(self.current_linear_velocity - optimal_speed)
+        if self.current_linear_velocity > 0:
+            # Reward forward movement, with bonus for optimal speed
+            velocity_reward = (self.current_linear_velocity - 0.3 * speed_diff) * velocity_reward_scale
+        else:
+            # Penalty for not moving forward
+            velocity_reward = self.current_linear_velocity * velocity_reward_scale * 2
+        
+        heat_penalty = 0.0
+        time_penalty = time_penalty_scale
+        # Penalize spinning more when not moving forward
+        spin_penalty = spin_penalty_scale * (abs(self.current_angular_velocity) *
+                                       max(0.01, 0.02 - self.current_linear_velocity * 0.01))
+        actor1_distance = self.actor1_distance_xy()
+        actor2_distance = self.actor2_distance_xy()
+        actor3_distance = self.actor3_distance_xy()
+        collision_penalty = 0.0
+        
+        if actor1_distance is not None:
+            if actor1_distance < 0.5:
+                collision_penalty += 15.0  # Critical zone
+            elif actor1_distance < 0.8:
+                collision_penalty += 5.0  # Warning zone  
+            elif actor1_distance < 1.2:
+                collision_penalty += 2.0  # Awareness zone
+
+        # Same structure for actor2
+        if actor2_distance is not None:
+            if actor2_distance < 0.5:
+                collision_penalty += 15.0
+            elif actor2_distance < 0.8:
+                collision_penalty += 5.0
+            elif actor2_distance < 1.2:
+                collision_penalty += 2.0
+
+
+        if actor3_distance is not None:
+            if actor3_distance < 0.5:
+                collision_penalty += 15.0  # Critical zone
+            elif actor3_distance < 0.8:
+                collision_penalty += 5.0  # Warning zone  
+            elif actor3_distance < 1.2:
+                collision_penalty += 2.0  # Awareness zone
+
+        #heatmap_sum = self.get_center_heatmap_sum(observation)
+
+        if collision_penalty == 0.0 and self.collision_last == True: # end of collsion
+            #ct_2 = time.time() - ct_1
+            print('\n################# Robot to close to Actor with act1',
+                  round(actor1_distance,2),' and act2 distances of', 
+                  round(actor2_distance,2),', act3 distance',  round(actor3_distance,2),
+                  ', lidars', observation['pose'], ', total collision', self.total_collision)
+            self.collision_last = False
+            self.total_collision = 0
+            
+        if collision_penalty >= 5.0: # collision
+            if self.collision_last == False:
+                #ct_1 = time.time()
+                print('collision start')
+            self.total_collision += collision_penalty 
+            self.collision_last = True
+        
+        
+        # Combine all rewards with proper weighting
+        total_reward = (
+            distance_reward +           # Primary navigation signal
+            heading_reward +            # Orientation guidance  
+            velocity_reward -           # Movement encouragement
+            #heat_penalty -              # Pedestrian avoidance
+            time_penalty -              # Efficiency incentive
+            spin_penalty -              # keep from spinning
+            collision_penalty            # Velocity col
+
+        )
+        
+        # Bonus for making progress while well-aligned (multiplicative bonus)
+        alignment_bonus = 0.0
+        if distance_delta > 0 and abs_heading_diff < math.pi/4:  # 45 degrees
+            alignment_bonus = distance_delta * 0.3
+            total_reward += alignment_bonus
+
+            
+
+        if self.total_steps % 2_000 == 0:
+            if False: #self.total_steps % 10_000 == 0:
+                save_fused_image_channels(observation['image'])
+            # print (as you had)
+            print(f"\nPose: ({self.current_pose.position.x:.2f}, {self.current_pose.position.y:.2f}), "
+                  f"Target: ({self.target_positions_x:.2f}, {self.target_positions_y:.2f}), "
+                  f"Dist: {current_distance:.3f}, Δd: {distance_delta:.3f}, "
+                  f"Heading: {math.degrees(self.current_yaw):.1f}°, "
+                  f"HeadDiff: {math.degrees(heading_diff):.1f}°, "
+                  f"LinVel: {self.current_linear_velocity:.3f}, AngVel: {self.current_angular_velocity:.3f}")
+            print(f"Rewards - Dist: {distance_reward:.3f}, Head: {heading_reward:.3f}, Vel: {velocity_reward:.3f}, "
+                  #f"Heat_reard: {heat_reward:.3f}, Spin: {-spin_penalty:.3f}, "
+                  f"Collision: {-collision_penalty:.3f}, Total: {total_reward:.3f}")
+
+
+
+        """            
+        if self.total_steps % 1_000 == 0:
+            # csv row
+            self._csv_writer.writerow([
+                int(self.total_steps),
+                float(self.sim_time) if hasattr(self, "sim_time") else 0.0,
+                float(self.current_pose.position.x), float(self.current_pose.position.y),
+                float(self.target_positions_x), float(self.target_positions_y),
+                float(current_distance), float(distance_delta),
+                float(math.degrees(self.current_yaw)), float(math.degrees(heading_diff)),
+                float(self.current_linear_velocity), float(self.current_angular_velocity),
+                float(distance_reward), float(heading_reward), float(velocity_reward),
+                float(heat_penalty), float(spin_penalty), float(time_penalty), float(collision_penalty),
+                float(alignment_bonus), float(total_reward)
+            ])
+            self._csv_file.flush()
+        """
+        self.previous_distance = current_distance
+        return total_reward    
+    
 
     def actor1_pose_callback(self, msg: Pose) -> None:
         """Store only the actor's (x, y) from geometry_msgs/Pose."""
@@ -403,6 +580,11 @@ class RoverEnvFused(gym.Env):
     def actor2_pose_callback(self, msg: Pose) -> None:
         """Store only the actor's (x, y) from geometry_msgs/Pose."""
         self.actor2_xy = (msg.position.x, msg.position.y)
+
+
+    def actor3_pose_callback(self, msg: Pose) -> None:
+        """Store only the actor's (x, y) from geometry_msgs/Pose."""
+        self.actor3_xy = (msg.position.x, msg.position.y)
 
     
     def is_actor1_close(self, radius: float = 0.8) -> bool:
@@ -435,7 +617,15 @@ class RoverEnvFused(gym.Env):
         ry = float(self.current_pose.position.y)
         ax, ay = float(self.actor2_xy[0]), float(self.actor2_xy[1])
         return math.hypot(ax - rx, ay - ry)
-
+    
+    def actor3_distance_xy(self) -> Optional[float]:
+        """Return 2D distance (meters) from robot to actor1 in the same world frame."""
+        if self.actor3_xy is None:
+            return None
+        rx = float(self.current_pose.position.x)
+        ry = float(self.current_pose.position.y)
+        ax, ay = float(self.actor3_xy[0]), float(self.actor3_xy[1])
+        return math.hypot(ax - rx, ay - ry)
 
     def is_actor2_close(self, radius: float = 0.8) -> bool:
         """Return True if actor is within radius (meters) of robot in 2D."""
@@ -447,6 +637,17 @@ class RoverEnvFused(gym.Env):
         dy = self.actor2_xy[1] - ry
         return (dx * dx + dy * dy) < (radius * radius)
 
+    def is_actor3_close(self, radius: float = 0.8) -> bool:
+        """Return True if actor is within radius (meters) of robot in 2D."""
+        if self.actor3_xy is None:
+            return False
+        rx = self.current_pose.position.x
+        ry = self.current_pose.position.y
+        dx = self.actor3_xy[0] - rx
+        dy = self.actor3_xy[1] - ry
+        return (dx * dx + dy * dy) < (radius * radius)
+
+    
         
     def get_fused_observation(self) -> np.ndarray:
         """Block until a new frame arrives, then return the fused observation from shared memory."""
@@ -647,164 +848,7 @@ class RoverEnvFused(gym.Env):
         return
 
 
-    def task_reward(self, observation):
-        """
-        Comprehensive reward function that balances navigation efficiency, 
-        heading alignment, velocity control, and pedestrian avoidance.
-        """
-        # Constants
-        success_distance = 0.3
-        distance_reward_scale = 4
-        heading_reward_scale = 0.03  # Increased from 0.02
-        velocity_reward_scale = 0.015  # Slightly increased
-        heatmap_penalty_scale = 1.0 #0.1  # Reduced from 1.0
-        time_penalty_scale = 0.008  # Small penalty per step to encourage efficiency
-        spin_penalty_scale = 1.8
-        heat_reward = 0.0
 
-        
-        # Get current state info
-        distance_heading_info = self.get_target_info()
-        current_distance = distance_heading_info[0]
-        heading_diff = distance_heading_info[1]
-
-        # Initialize previous distance if needed
-        if self.previous_distance is None:
-            self.previous_distance = current_distance
-            return 0.0
-        
-        # Check for goal achievement
-        if current_distance < success_distance:
-            self.update_target_pos()
-            return self.goal_reward
-        
-        # Distance progress reward (positive when getting closer)
-        distance_delta = self.previous_distance - current_distance
-        distance_reward = distance_delta * distance_reward_scale
-        
-        # Heading alignment reward
-        abs_heading_diff = abs(heading_diff)
-        
-        if abs_heading_diff <= math.pi/2:
-            # From 0 to 90 degrees: scale from 1 to 0
-            heading_alignment = 1.0 - (2 * abs_heading_diff / math.pi)
-        else:
-            # From 90 to 180 degrees: scale from 0 to -1
-            heading_alignment = -2 * (abs_heading_diff - math.pi/2) / math.pi
-        
-        heading_reward = heading_alignment * heading_reward_scale
-        
-        # Velocity reward - encourage forward movement, penalize excessive speed
-        optimal_speed = 0.4  # Target speed in m/s
-        speed_diff = abs(self.current_linear_velocity - optimal_speed)
-        if self.current_linear_velocity > 0:
-            # Reward forward movement, with bonus for optimal speed
-            velocity_reward = (self.current_linear_velocity - 0.3 * speed_diff) * velocity_reward_scale
-        else:
-            # Penalty for not moving forward
-            velocity_reward = self.current_linear_velocity * velocity_reward_scale * 2
-        
-        heat_penalty = 0.0
-        time_penalty = time_penalty_scale
-        # Penalize spinning more when not moving forward
-        spin_penalty = spin_penalty_scale * (abs(self.current_angular_velocity) *
-                                       max(0.01, 0.02 - self.current_linear_velocity * 0.01))
-        actor1_distance = self.actor1_distance_xy()
-        actor2_distance = self.actor2_distance_xy()
-        collision_penalty = 0.0
-        
-        if actor1_distance is not None:
-            if actor1_distance < 0.5:
-                collision_penalty += 15.0  # Critical zone
-            elif actor1_distance < 0.8:
-                collision_penalty += 5.0  # Warning zone  
-            elif actor1_distance < 1.2:
-                collision_penalty += 2.0  # Awareness zone
-
-        # Same structure for actor2
-        if actor2_distance is not None:
-            if actor2_distance < 0.5:
-                collision_penalty += 15.0
-            elif actor2_distance < 0.8:
-                collision_penalty += 5.0
-            elif actor2_distance < 1.2:
-                collision_penalty += 2.0
-
-        #heatmap_sum = self.get_center_heatmap_sum(observation)
-                
-        if self.total_steps % 10 == 0 and collision_penalty >= 10:
-            print('Robot to close to Actor with act1 and act2 distances of', round(actor1_distance,2),
-                  round(actor2_distance,2))
-
-        # replace your heatmap block with this tiny gate (2 s at 15 Hz = 30 steps)
-        heatmap_sum = self.get_center_heatmap_sum(observation)
-        if not hasattr(self, "next_heat_reward_step"): self.next_heat_reward_step = 0
-        if heatmap_sum > 0.0 and self.total_steps >= self.next_heat_reward_step and collision_penalty <= 2.0:
-            self.steps_run_time += 1
-            heat_mult = 60.0 + (40.0 / (1.0 + (self.steps_run_time / 10_000.0)) ) 
-            heat_reward = heatmap_sum * heat_mult
-            self.heat_reward_total += heat_reward
-
-            print('################## multiplier', heat_mult, 'heat_reward', heat_reward,
-                  ',  mean',  self.heat_reward_total /self.steps_run_time)
-            self.next_heat_reward_step = self.total_steps + 30
-        
-        # Combine all rewards with proper weighting
-        total_reward = (
-            distance_reward +           # Primary navigation signal
-            heading_reward +            # Orientation guidance  
-            velocity_reward -           # Movement encouragement
-            #heat_penalty -              # Pedestrian avoidance
-            time_penalty -              # Efficiency incentive
-            spin_penalty -              # keep from spinning
-            collision_penalty +           # Velocity col
-            heat_reward
-        )
-        
-        # Bonus for making progress while well-aligned (multiplicative bonus)
-        alignment_bonus = 0.0
-        if distance_delta > 0 and abs_heading_diff < math.pi/4:  # 45 degrees
-            alignment_bonus = distance_delta * 0.3
-            total_reward += alignment_bonus
-
-            
-
-        if self.total_steps % 2_000 == 0:
-            if False: #self.total_steps % 10_000 == 0:
-                save_fused_image_channels(observation['image'])
-            # print (as you had)
-            print(f"\nPose: ({self.current_pose.position.x:.2f}, {self.current_pose.position.y:.2f}), "
-                  f"Target: ({self.target_positions_x:.2f}, {self.target_positions_y:.2f}), "
-                  f"Dist: {current_distance:.3f}, Δd: {distance_delta:.3f}, "
-                  f"Heading: {math.degrees(self.current_yaw):.1f}°, "
-                  f"HeadDiff: {math.degrees(heading_diff):.1f}°, "
-                  f"LinVel: {self.current_linear_velocity:.3f}, AngVel: {self.current_angular_velocity:.3f}")
-            print(f"Rewards - Dist: {distance_reward:.3f}, Head: {heading_reward:.3f}, Vel: {velocity_reward:.3f}, "
-                  f"Heat_reard: {heat_reward:.3f}, Spin: {-spin_penalty:.3f}, "
-                  f"Collision: {-collision_penalty:.3f}, Total: {total_reward:.3f}")
-
-
-
-        """            
-        if self.total_steps % 1_000 == 0:
-            # csv row
-            self._csv_writer.writerow([
-                int(self.total_steps),
-                float(self.sim_time) if hasattr(self, "sim_time") else 0.0,
-                float(self.current_pose.position.x), float(self.current_pose.position.y),
-                float(self.target_positions_x), float(self.target_positions_y),
-                float(current_distance), float(distance_delta),
-                float(math.degrees(self.current_yaw)), float(math.degrees(heading_diff)),
-                float(self.current_linear_velocity), float(self.current_angular_velocity),
-                float(distance_reward), float(heading_reward), float(velocity_reward),
-                float(heat_penalty), float(spin_penalty), float(time_penalty), float(collision_penalty),
-                float(alignment_bonus), float(total_reward)
-            ])
-            self._csv_file.flush()
-        """
-        self.previous_distance = current_distance
-        return total_reward    
-    
 
     def get_heatmap_sum(self, observation: Dict[str, np.ndarray]) -> float:
         """
@@ -1023,126 +1067,62 @@ class RoverEnvFused(gym.Env):
 
                 
     def lidar_callback(self, msg):
-        # Convert to numpy array
+        # Convert raw ranges to numpy
         try:
-            lidar_data = np.array(msg.ranges, dtype=np.float32)
+            lidar_data = np.asarray(msg.ranges, dtype=np.float32)
         except Exception as e:
             print(f"Error converting LIDAR data to numpy array: {e}")
             return
 
-        # Replace inf/NaN/negatives
+        # Sanitize ranges
         lidar_data[np.isinf(lidar_data)] = self.max_lidar_range
         lidar_data[np.isnan(lidar_data)] = self.max_lidar_range
         lidar_data = np.clip(lidar_data, 0, self.max_lidar_range)
 
-        # Downsample
-        segment_size = len(lidar_data) // self.lidar_points
-        if segment_size == 0:
-            return
-        reshaped_data = lidar_data[:segment_size * self.lidar_points].reshape(self.lidar_points, segment_size)
-        self.lidar_data = np.min(reshaped_data, axis=1)
+        # True angles from LaserScan message
+        n = lidar_data.size
+        angles = msg.angle_min + np.arange(n, dtype=np.float32) * msg.angle_increment
 
-        # Angles for each downsampled bin
-        angles = np.linspace(0, 2 * np.pi, self.lidar_points, endpoint=False)
+        # Downsample to fixed number of bins
+        target_angles = np.linspace(-np.pi, np.pi, self.lidar_points, endpoint=False)
+        self.lidar_data[:] = self.max_lidar_range
 
-        # Helper to select min distance in an angular window
-        def min_in_sector(start_deg, end_deg):
-            start_rad = np.deg2rad(start_deg)
-            end_rad   = np.deg2rad(end_deg)
-            mask = (angles >= start_rad) & (angles < end_rad)
-            if not np.any(mask):
+        def angdiff(a, b):
+            d = a - b
+            return np.arctan2(np.sin(d), np.cos(d))
+
+        idx = np.argmin(np.abs(angdiff(angles[:, None], target_angles[None, :])), axis=1)
+        for b in range(self.lidar_points):
+            mask = (idx == b)
+            if np.any(mask):
+                self.lidar_data[b] = float(np.min(lidar_data[mask]))
+
+        def min_in_sector(deg_lo, deg_hi):
+            # Wrap to [-180, 180]
+            lo = ((deg_lo + 180) % 360) - 180
+            hi = ((deg_hi + 180) % 360) - 180
+            lo = np.deg2rad(lo)
+            hi = np.deg2rad(hi)
+            
+            if lo <= hi:
+                m = (angles >= lo) & (angles < hi)
+            else:  # sector crosses the wraparound
+                m = (angles >= lo) | (angles < hi)
+
+            if not np.any(m):
                 return self.max_lidar_range
-            return float(np.min(self.lidar_data[mask]))
+            return float(np.min(lidar_data[m]))
 
-        # Assign your three sectors
-        self.pose_lidar_1 = min_in_sector(30, 130)
-        self.pose_lidar_2 = min_in_sector(130, 230)
-        self.pose_lidar_3 = min_in_sector(230, 330)
-
-        self._received_scan = True
-
-                
-    def lidar_callback_old(self, msg):
-        # Process LIDAR data with error checking and downsampling.
-
-        # Convert to numpy array
-        try:
-            lidar_data = np.array(msg.ranges, dtype=np.float32)
-        except Exception as e:
-            print(f"Error converting LIDAR data to numpy array: {e}")
-            return
-
-            
-        if np.any(np.isnan(lidar_data)):
-            print(f"WARNING: Found {np.sum(np.isnan(lidar_data))} NaN values")
-            
-
-        # Replace inf values with max_lidar_range
-        inf_mask = np.isinf(lidar_data)
-        if np.any(inf_mask):
-            #print(f"INFO: Replaced {np.sum(inf_mask)} infinity values with max_lidar_range")
-            lidar_data[inf_mask] = self.max_lidar_range
-
-        # Replace any remaining invalid values (NaN, negative) with max_range
-        invalid_mask = np.logical_or(np.isnan(lidar_data), lidar_data < 0)
-        if np.any(invalid_mask):
-            print(f"INFO: Replaced {np.sum(invalid_mask)} invalid values with max_lidar_range")
-            lidar_data[invalid_mask] = self.max_lidar_range
-
-        # Clip values to valid range
-        lidar_data = np.clip(lidar_data, 0, self.max_lidar_range)
-
-        # Verify we have enough data points for downsampling
-        expected_points = self.lidar_points * (len(lidar_data) // self.lidar_points)
-        if expected_points == 0:
-            print(f"ERROR: Not enough LIDAR points for downsampling. Got {len(lidar_data)} points")
-            return
-
-        # Downsample by taking minimum value in each segment
-        try:
-            segment_size = len(lidar_data) // self.lidar_points
-            reshaped_data = lidar_data[:segment_size * self.lidar_points].reshape(self.lidar_points,
-                                                                                  segment_size)
-            self.lidar_data = np.min(reshaped_data, axis=1)
-            
-            # Verify downsampled data
-            if len(self.lidar_data) != self.lidar_points:
-                print(f"ERROR: Downsampled has wrong size. Expected {self.lidar_points}, got {len(self.lidar_data)}")
-                return
-                
-            if np.any(np.isnan(self.lidar_data)) or np.any(np.isinf(self.lidar_data)):
-                print("ERROR: Downsampled data contains invalid values")
-                print("NaN count:", np.sum(np.isnan(self.lidar_data)))
-                print("Inf count:", np.sum(np.isinf(self.lidar_data)))
-                return
-                
-        except Exception as e:
-            print(f"Error during downsampling: {e}")
-            return
-
-        #self.pose_lidar_1 =   # closest point between 30 and 130 degrees
-        #self.pose_lidar_2 =   # closest point between 130 and 230 degrees
-        #self.pose_lidar_3 =   # closest point between 230 and 330 degrees
+        l_1 = min_in_sector(30, 130)
+        l_2 = min_in_sector(330, 30)
+        l_3 = min_in_sector(230, 330)
+        # Assign three sector minima
+        self.pose_lidar_1 = l_1 if (l_1 <= 10.0) else 0.0
+        self.pose_lidar_2 = l_2 if (l_2 <= 10.0) else 0.0
+        self.pose_lidar_3 = l_3 if (l_3 <= 10.0) else 0.0
 
         self._received_scan = True
-
-    
-    """
-    def imu_callback(self, msg):
-        try:
-            quat = np.array([msg.orientation.w, msg.orientation.x, msg.orientation.y,
-                             msg.orientation.z])
-            norm = np.linalg.norm(quat)
-            if norm == 0:
-                raise ValueError("Received a zero-length quaternion")
-            quat_normalized = quat / norm
-            roll, pitch, yaw = quat2euler(quat_normalized, axes='sxyz')
-            self.current_pitch = pitch
-            self.current_roll = roll
-            self.current_yaw = yaw
-        except Exception as e:
-            self.node.get_logger().error(f"Error processing IMU data: {e}")
-    """
+                
     
     # Add this callback
     def odom_callback(self, msg):
