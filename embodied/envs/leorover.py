@@ -472,27 +472,27 @@ class RoverEnvFused(gym.Env):
         
         if actor1_distance is not None:
             if actor1_distance < 0.5:
-                collision_penalty += 15.0  # Critical zone
+                collision_penalty += 25.0  # Critical zone
             elif actor1_distance < 0.8:
-                collision_penalty += 5.0  # Warning zone  
+                collision_penalty += 8.0  # Warning zone  
             elif actor1_distance < 1.2:
                 collision_penalty += 2.0  # Awareness zone
 
         # Same structure for actor2
         if actor2_distance is not None:
             if actor2_distance < 0.5:
-                collision_penalty += 15.0
+                collision_penalty += 25.0
             elif actor2_distance < 0.8:
-                collision_penalty += 5.0
+                collision_penalty += 8.0
             elif actor2_distance < 1.2:
                 collision_penalty += 2.0
 
 
         if actor3_distance is not None:
             if actor3_distance < 0.5:
-                collision_penalty += 15.0  # Critical zone
+                collision_penalty += 25.0  # Critical zone
             elif actor3_distance < 0.8:
-                collision_penalty += 5.0  # Warning zone  
+                collision_penalty += 8.0  # Warning zone  
             elif actor3_distance < 1.2:
                 collision_penalty += 2.0  # Awareness zone
 
@@ -507,7 +507,7 @@ class RoverEnvFused(gym.Env):
             self.collision_last = False
             self.total_collision = 0
             
-        if collision_penalty >= 5.0: # collision
+        if collision_penalty >= 8.0: # collision
             if self.collision_last == False:
                 #ct_1 = time.time()
                 print('collision start')
