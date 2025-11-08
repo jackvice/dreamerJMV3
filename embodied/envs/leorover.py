@@ -226,8 +226,7 @@ class RoverEnvActivVis(gym.Env):
 
         # Stuck detection parameters
         self.stuck_threshold = 0.2   # total distance threshold over window (meters)
-        self.stuck_window = 300      # number of steps to look back
-        self._stuck_count = 0
+        self.stuck_window = 400      # number of steps to look back
         self._reference_position: Optional[tuple[float, float]] = None
         self._steps_since_reference = 0
         self.stuck_penalty = -25.0
@@ -288,7 +287,7 @@ class RoverEnvActivVis(gym.Env):
             "step","time_s","rx","ry","tx","ty","dist","delta_d",
             "yaw_deg","head_diff_deg","lin_vel","ang_vel",
             "r_dist","r_head","r_vel","p_heat","p_spin","p_time","p_close",
-            "align_bonus","total_reward"
+            "align_bonus","total_reward","av_align_deg","av_fixlen","vis_window"
         ])
         self._csv_file.flush()
 
@@ -378,6 +377,10 @@ class RoverEnvActivVis(gym.Env):
         self.out_hw_lut = 144   # build remap at 144x144 (AA render size)
         self.out_hw = 96
         self.top_frac = 1/3
+        # --- Active Vision minimal metrics ---
+        self._last_win_idx: int = self.current_window_index
+        self._fixlen: int = 1  # steps holding the same view
+
 
 
         # Define action space, [speed, desired_heading]
@@ -689,6 +692,61 @@ class RoverEnvActivVis(gym.Env):
 
 
         self.previous_distance = current_distance
+                # --- write one CSV row per step (minimal) ---
+
+        # Calculate active vision alignment metric
+        rx = float(self.current_pose.position.x)
+        ry = float(self.current_pose.position.y)
+        tx = float(self.target_positions_x)
+        ty = float(self.target_positions_y)
+        
+        # Goal bearing in world frame
+        goal_bearing = math.atan2(ty - ry, tx - rx)
+        
+        # Current camera window yaw in world frame
+        window_yaw_offset = math.radians(self.window_yaws_deg[self.current_window_index])
+        camera_view_world = self.current_yaw + window_yaw_offset
+        
+        # Angular difference between goal direction and camera view
+        angular_diff = goal_bearing - camera_view_world
+        av_align_deg = abs(math.degrees(math.atan2(math.sin(angular_diff), math.cos(angular_diff))))
+
+
+        
+        # Write CSV row with all metrics
+        if self.total_steps % 5 == 0:
+            self._csv_writer.writerow([
+                self._step,                                  # step
+                time.time(),                                 # time_s
+                float(self.current_pose.position.x),        # rx
+                float(self.current_pose.position.y),        # ry
+                float(self.target_positions_x),             # tx
+                float(self.target_positions_y),             # ty
+                float(current_distance),                     # dist
+                float(distance_delta),                       # delta_d
+                float(np.degrees(self.current_yaw)),        # yaw_deg
+                float(np.degrees(heading_diff)),            # head_diff_deg
+                float(self.current_linear_velocity),        # lin_vel
+                float(self.current_angular_velocity),       # ang_vel
+                float(distance_reward),                      # r_dist
+                float(heading_reward),                       # r_head
+                float(velocity_reward),                      # r_vel
+                0.0,                                         # p_heat (unused)
+                float(spin_penalty),                         # p_spin
+                float(time_penalty),                         # p_time
+                float(collision_penalty),                    # p_close
+                float(alignment_bonus),                      # align_bonus
+                float(total_reward),                         # total_reward
+                float(av_align_deg),                         # av_align_deg
+                int(self._fixlen),                           # av_fixlen
+                int(self.current_window_index)              # vis_window
+            ])
+            if (self._step % 200) == 0:
+                self._csv_file.flush()
+
+                
+
+
         return total_reward
     
 
@@ -710,6 +768,13 @@ class RoverEnvActivVis(gym.Env):
         if pan_action == 1:   self.current_window_index = max(0, self.current_window_index - 1)
         elif pan_action == 2: self.current_window_index = min(4, self.current_window_index + 1)  # K=5 => 0..4
 
+        # Update fixation length tracking
+        if self.current_window_index == self._last_win_idx:
+            self._fixlen += 1
+        else:
+            self._fixlen = 1
+            self._last_win_idx = self.current_window_index
+        
         # then movement
         speed_idx     = move_action // self.n_directions
         direction_idx = move_action %  self.n_directions
@@ -745,19 +810,34 @@ class RoverEnvActivVis(gym.Env):
         if self._reference_position is None:
             self._reference_position = np.asarray(pos, dtype=float)
             self._steps_since_reference = 0
-            self._stuck_count = 0
 
         elif self._steps_since_reference >= self.stuck_window:
             cur = np.asarray(pos, dtype=float)
             disp = float(np.linalg.norm(cur - self._reference_position))
+            
+            # Check if stuck (displacement below threshold over full window)
             if disp < self.stuck_threshold:
-                self._stuck_count += 1
-            else:
-                self._stuck_count = 0
-            # roll window after evaluating
+                # Early episode: spawn issue, no penalty
+                if self._step <= (self.stuck_window + 50):
+                    reward = 0.0
+                    reason = "spawn_stuck"
+                # Late episode: navigation stuck, apply penalty
+                else:
+                    reward = self.stuck_penalty
+                    reason = "navigation_stuck"
+                
+                print(f'Robot stuck: {reason}, displacement: {disp:.3f}m over {self.stuck_window} steps')
+                return observation, reward, True, {
+                    'steps': self._step, 
+                    'total_steps': self.total_steps,
+                    'stuck': True,
+                    'reason': reason,
+                    'reward': reward
+                }
+            
+            # Not stuck, roll window
             self._reference_position = cur
             self._steps_since_reference = 0
-
         
         
         if self.too_far_away():
@@ -912,7 +992,6 @@ class RoverEnvActivVis(gym.Env):
         else:
             return False
 
-
         
     def update_target_pos(self):
         print('###################################################### GOAL ACHIVED!')
@@ -976,10 +1055,13 @@ class RoverEnvActivVis(gym.Env):
     def reset(self, seed=None, options=None):
         print('################'+ self.world_name + ' Environment Reset')
         print('')
-        self._stuck_count = 0
-        self._last_pos_for_stuck = None
+        
         self._reference_position = None
         self._steps_since_reference = 0
+
+        # Reset active vision tracking
+        self._fixlen = 1 # AV metric
+        self._last_win_idx = self.current_window_index # AV metric
         
         twist = Twist()
         # Normal operation
