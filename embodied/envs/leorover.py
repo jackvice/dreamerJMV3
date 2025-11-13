@@ -366,6 +366,7 @@ class RoverEnvActivVis(gym.Env):
                                            endpoint=False)        
 
         # Active vision parameters
+        self.pan_action = 0
         self.num_windows = 5
         self.center_window = 2
         self.current_window_index = self.center_window
@@ -676,6 +677,10 @@ class RoverEnvActivVis(gym.Env):
             alignment_bonus = distance_delta * 0.3
             total_reward += alignment_bonus            
 
+        # Small cost to prevent random panning
+        pan_penalty = -0.02 if (self.pan_action != 0) else 0.0
+        total_reward += pan_penalty
+        
         if self.total_steps % 2_000 == 0:
             if self.total_steps % 10_000 == 0:
                 save_image(observation['image'], self.total_steps, self.current_window_index)
@@ -714,7 +719,7 @@ class RoverEnvActivVis(gym.Env):
 
         
         # Write CSV row with all metrics
-        if self.total_steps % 5 == 0:
+        if self.total_steps % 100 == 0:
             self._csv_writer.writerow([
                 self._step,                                  # step
                 time.time(),                                 # time_s
@@ -741,10 +746,8 @@ class RoverEnvActivVis(gym.Env):
                 int(self._fixlen),                           # av_fixlen
                 int(self.current_window_index)              # vis_window
             ])
-            if (self._step % 200) == 0:
-                self._csv_file.flush()
-
-                
+            #if (self._step % 200) == 0:
+            #    self._csv_file.flush()
 
 
         return total_reward
@@ -763,10 +766,10 @@ class RoverEnvActivVis(gym.Env):
                                                        'reward': 0.0}
         
         # Execute action
-        move_action, pan_action = self._decode_action(int(action))
+        move_action, self.pan_action = self._decode_action(int(action))
         # pan first
-        if pan_action == 1:   self.current_window_index = max(0, self.current_window_index - 1)
-        elif pan_action == 2: self.current_window_index = min(4, self.current_window_index + 1)  # K=5 => 0..4
+        if self.pan_action == 1:   self.current_window_index = max(0, self.current_window_index - 1)
+        elif self.pan_action == 2: self.current_window_index = min(4, self.current_window_index + 1)  # K=5 => 0..4
 
         # Update fixation length tracking
         if self.current_window_index == self._last_win_idx:
