@@ -37,166 +37,130 @@ scan_qos = QoSProfile(
 
 
 # Type definitions
-ObservationArray = npt.NDArray[np.float32]  # [H, W, 3]
 ImageRGB = npt.NDArray[np.uint8]  # [H, W, 3]
-WindowIndex = int  # 0-6
-WindowOffset = int  # x-coordinate in pixels
-        
 
-def crop_fisheye_top(image: ImageRGB) -> ImageRGB:
+
+def heatmap_to_vectors(heatmap: np.ndarray) -> np.ndarray:
+    """Convert 96×96 heatmap to column/row sum vectors."""
+    col_sums = np.sum(heatmap, axis=0)  # (96,)
+    row_sums = np.sum(heatmap, axis=1)  # (96,)
+    return np.concatenate([col_sums, row_sums])  # (192,)
+
+
+def read_rl_observation(shm: shared_memory.SharedMemory) -> Tuple[np.ndarray, np.ndarray, int]:
     """
-    Remove top 1/3 of fisheye image (200 pixels of sky).
-    
-    Args:
-        image: Original fisheye image [1024, 600, 3]
-        
-    Returns:
-        Cropped image [1024, 400, 3]
-    """
-    return image[200:, :, :]
-
-
-def calculate_window_x_offset(window_index: WindowIndex) -> WindowOffset:
-    """
-    Calculate x-coordinate for 256px windows with 50% overlap.
-    
-    Args:
-        window_index: Window position 0-6 (center is 3)
-        
-    Returns:
-        x-coordinate offset in pixels (0, 128, 256, 384, 512, 640, 768)
-    """
-    step_size: int = 128
-    return window_index * step_size
-
-
-def extract_window_region(
-    cropped_image: ImageRGB, 
-    window_index: WindowIndex
-) -> ImageRGB:
-    """
-    Extract 256-width × 400-height vertical strip from image.
-    
-    Args:
-        cropped_image: Cropped fisheye [1024, 400, 3]
-        window_index: Which window to extract (0-6)
-        
-    Returns:
-        Window strip [400, 256, 3]
-    """
-    x_offset: WindowOffset = calculate_window_x_offset(window_index)
-    return cropped_image[:, x_offset:x_offset + 256, :]
-
-
-def resize_to_square(window_strip: ImageRGB) -> ImageRGB:
-    """
-    Resize 256×400 strip to 96×96 square observation.
-    
-    Args:
-        window_strip: Vertical strip [400, 256, 3]
-        
-    Returns:
-        Square window [96, 96, 3]
-    """
-    return cv2.resize(window_strip, (96, 96), interpolation=cv2.INTER_AREA)
-
-
-def extract_and_resize_window(
-    full_image: ImageRGB,
-    window_index: WindowIndex
-) -> ImageRGB:
-    """
-    Complete pipeline: crop → extract 256×400 window → resize to 96×96.
-    
-    Args:
-        full_image: Original fisheye [1024, 600, 3]
-        window_index: Which window to extract (0-6)
-        
-    Returns:
-        Square observation [96, 96, 3]
-    """
-    cropped: ImageRGB = crop_fisheye_top(full_image)
-    strip: ImageRGB = extract_window_region(cropped, window_index)
-    return resize_to_square(strip)
-
-
-def save_fused_image_channels(fused_image: np.ndarray, output_dir: str = './out_images') -> None:
-    """
-    Save each channel of fused image as separate PNG files for debugging.
-    
-    Args:
-        fused_image: Fused observation array [H, W, 3] with values in [0,1]
-        output_dir: Directory to save images (default: './out_images')
-    """
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Convert from [0,1] to [0,255] and ensure uint8
-    fused_image_uint8 = (fused_image * 255).astype(np.uint8)
-    
-    # Extract and save each channel
-    now = datetime.now()
-    time_string = now.strftime("%M_%S")
-    #check_black = fused_image_uint8[:, :, 1]
-    #if np.sum(check_black) == 0: # if no person don't bother writing to file
-    #    return 
-    for i in range(3): #(3) for depth
-        channel = fused_image_uint8[:, :, i]
-        filename = f"channel_{time_string}_{i+1}.png"
-        filepath = os.path.join(output_dir, filename)
-        
-        cv2.imwrite(filepath, channel)
-    
-    print(f"Saved fused image channels to {output_dir}/channel_[1-3].png")
-
-
-
-def create_camera_matrices(
-    width: int = 1024,
-    height: int = 600,
-    hfov: float = 3.12  # radians from your fisheye SDF
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Create camera intrinsic matrix and distortion coefficients.
+    Read from rl_observation shared memory.
     
     Returns:
-        K: Camera matrix [3x3]
-        D: Distortion coefficients [4x1] for fisheye model
+        attention_heatmap: (96, 96) float32
+        fused_image: (96, 96, 3) uint8
+        step_count: int
     """
-    # Calculate focal length from HFOV
-    fx = width / (2.0 * np.tan(hfov / 2.0))
-    fy = fx  # Assume square pixels
+    # Read step_count
+    step_count = struct.unpack_from('<i', shm.buf, 0)[0]
     
-    # Principal point (image center)
+    # Read 96×96×4 observation
+    obs_bytes = bytes(shm.buf[4:4 + 96*96*4*4])  # 4 bytes per float32
+    obs_4ch = np.frombuffer(obs_bytes, dtype=np.float32).reshape(96, 96, 4)
+    
+    # Split channels
+    attention_heatmap = obs_4ch[:, :, 0]  # (96, 96)
+    fused_image = (obs_4ch[:, :, 1:] * 255).astype(np.uint8)  # (96, 96, 3)
+    
+    return attention_heatmap, fused_image, step_count
+
+
+def write_camera_control(shm: shared_memory.SharedMemory, 
+                         action: int, 
+                         step_count: int) -> None:
+    """Write active_vision_action and step_count to camera_latest shared memory."""
+    action_offset = 8 + 6 * (320 * 320 * 3)  # 921608
+    struct.pack_into('<i', shm.buf, action_offset, action)
+    struct.pack_into('<i', shm.buf, action_offset + 4, step_count)
+
+    
+def save_image(img: np.ndarray, step: int, window_num: int, out_dir: str = "./out_images") -> str:
+    """Save RGB image safely; supports float[0..1] or uint8. Returns file path."""
+    os.makedirs(out_dir, exist_ok=True)
+    if img.dtype != np.uint8:
+        img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
+    # ensure 3-channel BGR for OpenCV
+    if img.ndim == 2:
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    else:
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(out_dir, f"obs_step{step}_{ts}_{window_num}.png")
+    cv2.imwrite(path, img_bgr)
+    return path
+
+
+# ---- geometry: HFOV -> intrinsics (rectilinear) ----
+def intrinsics_from_hfov(width: int, height: int, hfov_rad: float) -> np.ndarray:
+    """Pinhole intrinsics K from HFOV; square pixels."""
+    fx = width / (2.0 * np.tan(hfov_rad / 2.0))
+    fy = fx
     cx = width / 2.0
     cy = height / 2.0
-    
-    # Camera matrix
-    K = np.array([
-        [fx, 0, cx],
-        [0, fy, cy],
-        [0, 0, 1]
-    ], dtype=np.float64)
-    
-    # Fisheye distortion coefficients from your SDF
-    # OpenCV fisheye model uses k1, k2, k3, k4
-    D = np.array([
-        -0.279817,  # k1
-        0.060321,   # k2
-        0.000487,   # k3
-        0.000310    # k4 (using p1 from SDF)
-    ], dtype=np.float64)
-    
-    return K, D
+    return np.array([[fx, 0, cx],
+                     [0,  fy, cy],
+                     [0,   0,  1]], dtype=np.float32)
 
 
-# Then simplify undistort_fisheye to just:
-def undistort_fisheye(distorted_image: ImageRGB, map1, map2) -> ImageRGB:
-    return cv2.remap(
-        distorted_image, map1, map2,
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT
-    )
+def adjust_K_for_crop(K: np.ndarray, crop_top_px: int) -> np.ndarray:
+    """Shift principal point after cropping top rows off the source image."""
+    Kc = K.copy()
+    Kc[1, 2] = K[1, 2] - float(crop_top_px)
+    return Kc
+
+# ---- build a yaw-specific rectilinear->rectilinear remap ----
+
+def heatmap_to_vectors(heatmap: np.ndarray) -> np.ndarray:
+    """
+    Convert 2D heatmap to row/column sum vectors.
+    
+    Args:
+        heatmap: shape (96, 96) with values in [0, 1]
+    
+    Returns:
+        Vector of shape (192,) where:
+        - [0:96] = column sums (sum over rows for each column)
+        - [96:192] = row sums (sum over columns for each row)
+    """
+    col_sums = np.sum(heatmap, axis=0)  # (96,)
+    row_sums = np.sum(heatmap, axis=1)  # (96,)
+    return np.concatenate([col_sums, row_sums])
+
+
+def build_lut_bank(
+    src_size: Tuple[int, int],   # (Wc, Hc) after crop
+    hfov_src: float,
+    yaws_deg: Tuple[float, ...],
+    hfov_win_deg: float = 60.0,
+    out_hw: int = 96,
+    crop_top_px: int = 0
+) -> Dict[int, Tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]]:
+    """Precompute remap LUTs for each yaw bin."""
+    bank: Dict[int, Tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]] = {}
+    for idx, yaw in enumerate(yaws_deg):
+        mx, my = make_yaw_lut_rect_to_rect(
+            src_size=src_size,
+            dst_hw=out_hw,
+            hfov_src=hfov_src,
+            hfov_win=np.deg2rad(hfov_win_deg),
+            yaw_deg=yaw,
+            crop_top_px=crop_top_px
+        )
+        bank[idx] = (mx, my)
+    return bank
+
+
+def extract_view_with_lut(src_cropped: ImageRGB, lut: Tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]) -> ImageRGB:
+    """Apply precomputed (map_x, map_y) to the cropped source image."""
+    map_x, map_y = lut
+    return cv2.remap(src_cropped, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+
 
 
 class RoverEnvActivVis(gym.Env):
@@ -223,6 +187,8 @@ class RoverEnvActivVis(gym.Env):
         self.bridge = CvBridge()
         self.node = rclpy.create_node('turtlebot_controller')
 
+        self.control_period = 0.02   # 20 Hz
+        self._next_tick = time.monotonic()  
 
         # Initialize these in __init__
         self.current_linear_velocity = 0.0
@@ -254,9 +220,8 @@ class RoverEnvActivVis(gym.Env):
         self.total_collision = 0
 
         # Stuck detection parameters
-        self.stuck_threshold = 0.3   # total distance threshold over window (meters)
-        self.stuck_window = 200      # number of steps to look back
-        self._stuck_count = 0
+        self.stuck_threshold = 0.2   # total distance threshold over window (meters)
+        self.stuck_window = 400      # number of steps to look back
         self._reference_position: Optional[tuple[float, float]] = None
         self._steps_since_reference = 0
         self.stuck_penalty = -25.0
@@ -317,7 +282,7 @@ class RoverEnvActivVis(gym.Env):
             "step","time_s","rx","ry","tx","ty","dist","delta_d",
             "yaw_deg","head_diff_deg","lin_vel","ang_vel",
             "r_dist","r_head","r_vel","p_heat","p_spin","p_time","p_close",
-            "align_bonus","total_reward"
+            "align_bonus","total_reward","av_align_deg","av_fixlen","vis_window"
         ])
         self._csv_file.flush()
 
@@ -328,7 +293,7 @@ class RoverEnvActivVis(gym.Env):
         if self.world_name == 'inspect':
 
             self.rand_x_range = (-27, -12) # actor area (-27, -12) # actor area 
-            self.rand_y_range = (-25, -19) #  actor area (-25, -1) #  actor area 
+            self.rand_y_range = (-25, -19.2) #  actor area (-25, -1) #  actor area 
             self.rand_goal_x_range = (-27, -14) # actor area test values (-27, -14)  
             self.rand_goal_y_range = (-25, -18) # actor area test values (-25, -18) 
 
@@ -396,25 +361,42 @@ class RoverEnvActivVis(gym.Env):
                                            endpoint=False)        
 
         # Active vision parameters
-        self.num_windows: int = 7
-        self.center_window: WindowIndex = 3
-        self.current_window_index: WindowIndex = self.center_window
+        self.pan_action = 0
+        self.num_windows = 5
+        self.center_window = 2
+        self.current_window_index = self.center_window
         self.latest_fisheye_image: Optional[ImageRGB] = None
+        # five bins centered at [-60, -30, 0, +30, +60] deg
+        self.window_yaws_deg = (-60.0, -30.0, 0.0, 30.0, 60.0)
+        self._lut_bank = None  # built lazily after first image arrives
+        self.hfov_src = 2.8    # radians, from your SDF
+        self.out_hw_lut = 144   # build remap at 144x144 (AA render size)
+        self.out_hw = 96
+        self.top_frac = 1/3
+        # --- Active Vision minimal metrics ---
+        self._last_win_idx: int = self.current_window_index
+        self._fixlen: int = 1  # steps holding the same view
+
+
 
         # Define action space, [speed, desired_heading]
         #self.action_space = spaces.Discrete((self.n_speeds * self.n_directions) + 3 ) # 3 for stop, left, right for pan camera
-        self.action_space = spaces.MultiDiscrete([self.n_speeds * self.n_directions, 3]) # 3 for stop, left, right for pan camera
+        
 
-        # In __init__, after line 443:
-        self.camera_K, self.camera_D = create_camera_matrices()
-        # Add these lines:
-        h, w = 600, 1024
-        new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
-            self.camera_K, self.camera_D, (w, h), np.eye(3), balance=0.0
-        )
-        self.undistort_map1, self.undistort_map2 = cv2.fisheye.initUndistortRectifyMap(
-            self.camera_K, self.camera_D, np.eye(3), new_K, (w, h), cv2.CV_16SC2
-        )
+        self.n_move = self.n_speeds * self.n_directions   # movement branch
+        self.n_pan = 3                                     # 0=none, 1=left, 2=right
+        self.action_space = spaces.Discrete(self.n_move * self.n_pan)
+        
+        # Shared memory connections
+        try:
+            self.rl_obs_shm = shared_memory.SharedMemory(name='rl_observation')
+            self.camera_shm = shared_memory.SharedMemory(name='camera_latest')
+            self.last_obs_step = -1
+            print("Connected to shared memory segments")
+        except FileNotFoundError as e:
+            print(f"Shared memory not found: {e}")
+            raise
+        
 
         self.episode_log_path = '/home/jack/src/RoboTerrain/metrics_analyzer/data/episode_logs/'
         os.makedirs(self.episode_log_path, exist_ok=True)
@@ -427,8 +409,13 @@ class RoverEnvActivVis(gym.Env):
                 shape=(96, 96, 3),
                 dtype=np.uint8
             ),
-            'vis_window':spaces.Discrete(7),
-            
+            'vis_window':spaces.Discrete(5),
+            'heat_vector': spaces.Box(
+                low=0.0,
+                high=96.0,
+                shape=(192,),
+                dtype=np.float32
+            ),
             'imu': spaces.Box(
                 low=np.array([-np.pi, -np.pi, -np.pi]),
                 high=np.array([np.pi, np.pi, np.pi]),
@@ -508,43 +495,14 @@ class RoverEnvActivVis(gym.Env):
             qos_profile
         )
 
-        # In __init__, replace rl_obs_shm setup with:
-        self.camera_subscriber = self.node.create_subscription(
-            Image,
-            '/camera/image_raw',
-            self.camera_callback,
-            qos_profile
-        )
 
 
-    def camera_callback(self, msg: Image) -> None:
-        """Store latest fisheye image from camera topic."""
-        try:
-            cv_image: ImageRGB = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
-            self.latest_fisheye_image = cv_image  # Simple assignment, no lock needed
-        except Exception as e:
-            self.node.get_logger().error(f"Error in camera callback: {e}")
-
-
-
-    def get_camera_window(self) -> ImageRGB:
-        """Get current windowed view from undistorted fisheye camera."""
-        timeout: float = 2.0
-        start_time: float = time.time()
-    
-        while self.latest_fisheye_image is None:
-            rclpy.spin_once(self.node, timeout_sec=0.01)
-            if time.time() - start_time > timeout:
-                raise TimeoutError("No fisheye image received within timeout")
-
-        undistorted = undistort_fisheye(
-            self.latest_fisheye_image,
-            self.undistort_map1,
-            self.undistort_map2
-        )
-
-        # Then extract window
-        return extract_and_resize_window(undistorted, self.current_window_index)
+    def _decode_action(self, a: int) -> tuple[int, int]:
+        """-> (move_idx, pan_idx) with pan_idx in {0,1,2}"""
+        move = a // self.n_pan
+        pan  = a %  self.n_pan
+        return move, pan
+        
 
     def task_reward(self, observation):
         # Constants
@@ -641,8 +599,8 @@ class RoverEnvActivVis(gym.Env):
             #ct_2 = time.time() - ct_1
             print('\n################# Robot to close to Actor with act1',
                   round(actor1_distance,2),' and act2 distances of', 
-                  round(actor2_distance,2),#', act3 distance',  round(actor3_distance,2),
-                  ', vis_window', observation['vis_window'], ', total collision', self.total_collision)
+                  round(actor2_distance,2), ', act3 distance',  round(actor3_distance,2),
+                  ', total collision', self.total_collision)
             self.collision_last = False
             self.total_collision = 0
             
@@ -669,47 +627,193 @@ class RoverEnvActivVis(gym.Env):
         alignment_bonus = 0.0
         if distance_delta > 0 and abs_heading_diff < math.pi/4:  # 45 degrees
             alignment_bonus = distance_delta * 0.3
-            total_reward += alignment_bonus
+            total_reward += alignment_bonus            
 
-            
-
+        # Small cost to prevent random panning
+        pan_penalty = -0.02 if (self.pan_action != 0) else 0.0
+        total_reward += pan_penalty
+        
         if self.total_steps % 2_000 == 0:
-            if False:#self.total_steps % 50_000 == 0:
-                save_fused_image_channels(observation['image'])
+            if self.total_steps % 10_000 == 0:
+                save_image(observation['image'], self.total_steps, self.current_window_index)
             # print (as you had)
             print(f"\nPose: ({self.current_pose.position.x:.2f}, {self.current_pose.position.y:.2f}), "
                   f"Target: ({self.target_positions_x:.2f}, {self.target_positions_y:.2f}), "
                   f"Dist: {current_distance:.3f}, Δd: {distance_delta:.3f}, "
                   f"Heading: {math.degrees(self.current_yaw):.1f}°, "
-                  f"HeadDiff: {math.degrees(heading_diff):.1f}°, "
+                  f"HeadDiff: {math.degrees(heading_diff):.1f}°, window_num {self.current_window_index}, "
                   f"LinVel: {self.current_linear_velocity:.3f}, AngVel: {self.current_angular_velocity:.3f}")
             print(f"Rewards - Dist: {distance_reward:.3f}, Head: {heading_reward:.3f}, Vel: {velocity_reward:.3f}, "
                   #f"Heat_reard: {heat_reward:.3f}, Spin: {-spin_penalty:.3f}, "
                   f"Collision: {-collision_penalty:.3f}, Total: {total_reward:.3f}")
 
 
-
-        """            
-        if self.total_steps % 1_000 == 0:
-            # csv row
-            self._csv_writer.writerow([
-                int(self.total_steps),
-                float(self.sim_time) if hasattr(self, "sim_time") else 0.0,
-                float(self.current_pose.position.x), float(self.current_pose.position.y),
-                float(self.target_positions_x), float(self.target_positions_y),
-                float(current_distance), float(distance_delta),
-                float(math.degrees(self.current_yaw)), float(math.degrees(heading_diff)),
-                float(self.current_linear_velocity), float(self.current_angular_velocity),
-                float(distance_reward), float(heading_reward), float(velocity_reward),
-                float(heat_penalty), float(spin_penalty), float(time_penalty), float(collision_penalty),
-                float(alignment_bonus), float(total_reward)
-            ])
-            self._csv_file.flush()
-        """
         self.previous_distance = current_distance
-        return total_reward    
+                # --- write one CSV row per step (minimal) ---
+
+        # Calculate active vision alignment metric
+        rx = float(self.current_pose.position.x)
+        ry = float(self.current_pose.position.y)
+        tx = float(self.target_positions_x)
+        ty = float(self.target_positions_y)
+        
+        # Goal bearing in world frame
+        goal_bearing = math.atan2(ty - ry, tx - rx)
+        
+        # Current camera window yaw in world frame
+        window_yaw_offset = math.radians(self.window_yaws_deg[self.current_window_index])
+        camera_view_world = self.current_yaw + window_yaw_offset
+        
+        # Angular difference between goal direction and camera view
+        angular_diff = goal_bearing - camera_view_world
+        av_align_deg = abs(math.degrees(math.atan2(math.sin(angular_diff), math.cos(angular_diff))))
+
+
+        
+        # Write CSV row with all metrics
+        if self.total_steps % 100 == 0:
+            self._csv_writer.writerow([
+                self._step,                                  # step
+                time.time(),                                 # time_s
+                float(self.current_pose.position.x),        # rx
+                float(self.current_pose.position.y),        # ry
+                float(self.target_positions_x),             # tx
+                float(self.target_positions_y),             # ty
+                float(current_distance),                     # dist
+                float(distance_delta),                       # delta_d
+                float(np.degrees(self.current_yaw)),        # yaw_deg
+                float(np.degrees(heading_diff)),            # head_diff_deg
+                float(self.current_linear_velocity),        # lin_vel
+                float(self.current_angular_velocity),       # ang_vel
+                float(distance_reward),                      # r_dist
+                float(heading_reward),                       # r_head
+                float(velocity_reward),                      # r_vel
+                0.0,                                         # p_heat (unused)
+                float(spin_penalty),                         # p_spin
+                float(time_penalty),                         # p_time
+                float(collision_penalty),                    # p_close
+                float(alignment_bonus),                      # align_bonus
+                float(total_reward),                         # total_reward
+                float(av_align_deg),                         # av_align_deg
+                int(self._fixlen),                           # av_fixlen
+                int(self.current_window_index)              # vis_window
+            ])
+            #if (self._step % 200) == 0:
+            #    self._csv_file.flush()
+
+
+        return total_reward
     
 
+    def step(self, action):
+        """Execute one time step within the environment"""
+        t0 = time.monotonic()
+        self.total_steps += 1
+                
+        # Check step limit first (most efficient termination check)
+        self._step += 1
+        if self._step >= self._length:
+            print(f"Episode length limit reached: {self._step} >= {self._length}")
+            return self.get_observation(), 0.0, True, {'steps': self._step, 'total_steps': self.total_steps,
+                                                       'reward': 0.0}
+        
+        # Execute action
+        move_action, self.pan_action = self._decode_action(int(action))
+        # pan first
+        if self.pan_action == 1:   self.current_window_index = max(0, self.current_window_index - 1)
+        elif self.pan_action == 2: self.current_window_index = min(4, self.current_window_index + 1)  # K=5 => 0..4
+
+        # Update fixation length tracking
+        if self.current_window_index == self._last_win_idx:
+            self._fixlen += 1
+        else:
+            self._fixlen = 1
+            self._last_win_idx = self.current_window_index
+            # Write Active Vision action to shared memory for inference.py
+            write_camera_control(self.camera_shm, self.current_window_index, self.total_steps)
+        
+        # then movement
+        speed_idx     = move_action // self.n_directions
+        direction_idx = move_action %  self.n_directions
+
+        speed = float(self.speed_levels[speed_idx])
+        desired_heading = float(self.direction_angles[direction_idx])
+        
+        angular_velocity = self.heading_controller(desired_heading, self.current_yaw)
+        twist = Twist()
+        twist.linear.x = speed
+        twist.angular.z = angular_velocity
+        self.publisher.publish(twist)
+        self.last_speed = speed
+        
+        # Get new observation after action
+        rclpy.spin_once(self.node, timeout_sec=0.01)
+        observation = self.get_observation()
+        t1 = perf_counter()
+        
+        # Check state-based termination conditions using new state
+        if self.is_robot_flipped():
+            reward = -25 if self._step > 500 else 0.0
+            print('Robot flipped, episode done')
+            return observation, reward, True, {'steps': self._step, 'total_steps': self.total_steps,
+                                               'reward': reward}
+
+
+        # Update stuck detection
+        pos = (self.current_pose.position.x, self.current_pose.position.y)
+        self._steps_since_reference += 1
+
+        # Set or update reference position
+        if self._reference_position is None:
+            self._reference_position = np.asarray(pos, dtype=float)
+            self._steps_since_reference = 0
+
+        elif self._steps_since_reference >= self.stuck_window:
+            cur = np.asarray(pos, dtype=float)
+            disp = float(np.linalg.norm(cur - self._reference_position))
+            
+            # Check if stuck (displacement below threshold over full window)
+            if disp < self.stuck_threshold:
+                # Early episode: spawn issue, no penalty
+                if self._step <= (self.stuck_window + 50):
+                    reward = 0.0
+                    reason = "spawn_stuck"
+                # Late episode: navigation stuck, apply penalty
+                else:
+                    reward = self.stuck_penalty
+                    reason = "navigation_stuck"
+                
+                print(f'Robot stuck: {reason}, displacement: {disp:.3f}m over {self.stuck_window} steps')
+                return observation, reward, True, {
+                    'steps': self._step, 
+                    'total_steps': self.total_steps,
+                    'stuck': True,
+                    'reason': reason,
+                    'reward': reward
+                }
+            
+            # Not stuck, roll window
+            self._reference_position = cur
+            self._steps_since_reference = 0
+        
+        
+        if self.too_far_away():
+            print('Too far away, resetting.')
+            return observation, self.too_far_away_penilty, True, {'steps': self._step,
+                                                                  'total_steps': self.total_steps,
+                                                                  'reward': self.too_far_away_penilty}
+        
+        # Calculate reward only if continuing
+        reward = self.task_reward(observation)
+        
+        elapsed = time.monotonic() - t0
+        remain = self.control_period - elapsed
+        if remain > 0:
+            time.sleep(remain)
+        return observation, reward, False, {'steps': self._step, 'total_steps': self.total_steps,
+                                            'reward': reward}
+
+    
     def actor1_pose_callback(self, msg: Pose) -> None:
         """Store only the actor's (x, y) from geometry_msgs/Pose."""
         self.actor1_xy = (msg.position.x, msg.position.y)
@@ -788,21 +892,25 @@ class RoverEnvActivVis(gym.Env):
         dy = self.actor3_xy[1] - ry
         return (dx * dx + dy * dy) < (radius * radius)
 
-    
 
     def get_observation(self):
+        # Read from shared memory
+        attention_heatmap, fused_image, step_count = read_rl_observation(self.rl_obs_shm)
+    
+        # Convert heatmap to vectors
+        heat_vectors = heatmap_to_vectors(attention_heatmap)
+    
         return {
-
-            'image': self.get_camera_window(),
+            'image': fused_image,
             'vis_window': self.current_window_index,
-            
+            'heat_vector': heat_vectors,  # (192,) float32
             'imu': np.array([self.current_pitch, self.current_roll, self.current_yaw],
                             dtype=np.float32),
             'target': self.get_target_info(),
             'velocities': np.array([self.current_linear_velocity, self.current_angular_velocity],
                                    dtype=np.float32)
-        }    
-
+        }
+    
     
     def heading_controller(self, desired_heading, current_heading):
         """
@@ -845,112 +953,6 @@ class RoverEnvActivVis(gym.Env):
             return True
         else:
             return False
-
-
-    def step(self, action):
-        """Execute one time step within the environment"""
-        self.total_steps += 1
-        t0 = perf_counter()
-        
-        # Check step limit first (most efficient termination check)
-        self._step += 1
-        if self._step >= self._length:
-            print(f"Episode length limit reached: {self._step} >= {self._length}")
-            return self.get_observation(), 0.0, True, {'steps': self._step, 'total_steps': self.total_steps,
-                                                       'reward': 0.0}
-        
-        # Execute action
-
-        action = np.asarray(action, dtype=int)
-        movement_action: int = int(action[0])
-        pan_action: int = int(action[1])
-
-        # Handle panning first
-        if pan_action == 1:  # pan_left
-            self.current_window_index = max(0, self.current_window_index - 1)
-        elif pan_action == 2:  # pan_right
-            self.current_window_index = min(6, self.current_window_index + 1)  # Changed from 19 to 6
-
-        # Then handle movement
-        action = movement_action  # Reassign for the rest of the function
-
-        speed_idx = action // self.n_directions
-        direction_idx = action % self.n_directions
-        speed = float(self.speed_levels[speed_idx])
-        desired_heading = float(self.direction_angles[direction_idx])
-        
-        angular_velocity = self.heading_controller(desired_heading, self.current_yaw)
-        twist = Twist()
-        twist.linear.x = speed
-        twist.angular.z = angular_velocity
-        self.publisher.publish(twist)
-        self.last_speed = speed
-        
-        # Get new observation after action
-        rclpy.spin_once(self.node, timeout_sec=0.01)
-        observation = self.get_observation()
-        t1 = perf_counter()
-        
-        # Check state-based termination conditions using new state
-        if self.is_robot_flipped():
-            reward = -25 if self._step > 500 else 0.0
-            print('Robot flipped, episode done')
-            return observation, reward, True, {'steps': self._step, 'total_steps': self.total_steps,
-                                               'reward': reward}
-
-
-        # Update stuck detection
-        pos = (self.current_pose.position.x, self.current_pose.position.y)
-        self._steps_since_reference += 1
-
-        # Set or update reference position
-        if self._reference_position is None or self._steps_since_reference >= self.stuck_window:
-            self._reference_position = pos
-            self._steps_since_reference = 0
-            self._stuck_count = 0  # Reset count when we set new reference
-
-        # Only check for stuck after we've waited the full window
-        if self._steps_since_reference >= self.stuck_window:
-            dx = pos[0] - self._reference_position[0]
-            dy = pos[1] - self._reference_position[1] 
-            total_progress = math.hypot(dx, dy)
-            
-            if total_progress < self.stuck_threshold:
-                self._stuck_count += 1
-                if self._stuck_count >= 3:  # Require multiple consecutive detections
-                    print(f'Robot stuck: only moved {total_progress:.2f}m in {self.stuck_window} steps')
-                    return observation, self.stuck_penalty, True, {'steps': self._step, 'total_steps': self.total_steps,
-                                                                   'reward': self.stuck_penalty}
-            else:
-                self._stuck_count = 0
-        
-        
-        if self.too_far_away():
-            print('Too far away, resetting.')
-            return observation, self.too_far_away_penilty, True, {'steps': self._step,
-                                                                  'total_steps': self.total_steps,
-                                                                  'reward': self.too_far_away_penilty}
-        
-        # Calculate reward only if continuing
-        reward = self.task_reward(observation)
-        
-        # Debug output
-        """
-        if self.total_steps % 10_000 == 0:
-            temp_obs_target = self.get_target_info()
-            print(f"current pose x,y: ({self.current_pose.position.x:.2f}, {self.current_pose.position.y:.2f}), "
-                  f"Speed: {speed:.2f}, Heading: {math.degrees(self.current_yaw):.1f}°")
-            print(f"current target x,y: ({self.target_positions_x:.2f}, {self.target_positions_y:.2f}), "
-                  f"distance and angle to target: ({temp_obs_target[0]:.3f}, {temp_obs_target[1]:.3f}), "
-                  f"Final Reward: {reward:.3f}")
-        
-        if self.total_steps % 5000 == 0:
-            print(f"time_ms total:{(perf_counter()-t0)*1000}, obs_get:{(t1-t0)*1000}")
-        if self.total_steps % 50000 == 0:
-            save_fused_image_channels(observation['image'])
-        """
-        return observation, reward, False, {'steps': self._step, 'total_steps': self.total_steps,
-                                            'reward': reward}
 
         
     def update_target_pos(self):
@@ -1015,10 +1017,15 @@ class RoverEnvActivVis(gym.Env):
     def reset(self, seed=None, options=None):
         print('################'+ self.world_name + ' Environment Reset')
         print('')
-        self._stuck_count = 0
-        self._last_pos_for_stuck = None
+        
         self._reference_position = None
         self._steps_since_reference = 0
+
+        # Reset active vision tracking
+        self._fixlen = 1 # AV metric
+        self._last_win_idx = self.current_window_index # AV metric
+        # Initialize shared memory with starting window and step=0
+        write_camera_control(self.camera_shm, self.current_window_index, 0)
         
         twist = Twist()
         # Normal operation

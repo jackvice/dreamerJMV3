@@ -40,8 +40,77 @@ scan_qos = QoSProfile(
 ImageRGB = npt.NDArray[np.uint8]  # [H, W, 3]
 
 
+def heatmap_to_vectors(heatmap: np.ndarray) -> np.ndarray:
+    """Convert 96×96 heatmap to column/row sum vectors."""
+    col_sums = np.sum(heatmap, axis=0)  # (96,)
+    row_sums = np.sum(heatmap, axis=1)  # (96,)
+    return np.concatenate([col_sums, row_sums])  # (192,)
+
+
+def read_rl_observation(shm: shared_memory.SharedMemory) -> Tuple[np.ndarray, np.ndarray, int]:
+    """
+    Read from rl_observation shared memory.
+    
+    Returns:
+        attention_heatmap: (96, 96) float32
+        fused_image: (96, 96, 3) uint8
+        step_count: int
+    """
+    # Read step_count
+    step_count = struct.unpack_from('<i', shm.buf, 0)[0]
+    
+    # Read 96×96×4 observation
+    obs_bytes = bytes(shm.buf[4:4 + 96*96*4*4])  # 4 bytes per float32
+    obs_4ch = np.frombuffer(obs_bytes, dtype=np.float32).reshape(96, 96, 4)
+    
+    # Split channels
+    attention_heatmap = obs_4ch[:, :, 0]  # (96, 96)
+    fused_image = (obs_4ch[:, :, 1:] * 255).astype(np.uint8)  # (96, 96, 3)
+    
+    return attention_heatmap, fused_image, step_count
+
+
+def write_camera_control(shm: shared_memory.SharedMemory, 
+                         action: int, 
+                         step_count: int) -> None:
+    """Write active_vision_action and step_count to camera_latest shared memory."""
+    action_offset = 8 + 6 * (320 * 320 * 3)  # 921608
+    struct.pack_into('<i', shm.buf, action_offset, action)
+    struct.pack_into('<i', shm.buf, action_offset + 4, step_count)
+
+def save_fused_image_channels(fused_image: np.ndarray, step: int, window_num: int, output_dir: str = './out_images') -> None:
+    """
+    Save each channel of fused image as separate PNG files for debugging.
+    
+    Args:
+        fused_image: Fused observation array [H, W, 3] with values in [0,1]
+        output_dir: Directory to save images (default: './out_images')
+    """
+    # Create output directory if it doesn't exist
+    print(' ################### Saving fused image channels')
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Convert from [0,1] to [0,255] and ensure uint8
+    fused_image_uint8 = (fused_image * 255).astype(np.uint8)
+    
+    # Extract and save each channel
+    now = datetime.now()
+    time_string = now.strftime("%M_%S")
+    #check_black = fused_image_uint8[:, :, 1]
+    #if np.sum(check_black) == 0: # if no person don't bother writing to file
+    #    return 
+    for i in range(3): #(3) for depth
+        channel = fused_image_uint8[:, :, i]
+        filename = f"channel_{step}_{window_num}_{i+1}.png"
+        filepath = os.path.join(output_dir, filename)
+        
+        cv2.imwrite(filepath, channel)
+    
+    print(f"Saved fused image channels to {output_dir}/channel_[1-3].png")
+    
 def save_image(img: np.ndarray, step: int, window_num: int, out_dir: str = "./out_images") -> str:
     """Save RGB image safely; supports float[0..1] or uint8. Returns file path."""
+    print('saving fused image shape:', img.shape)
     os.makedirs(out_dir, exist_ok=True)
     if img.dtype != np.uint8:
         img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
@@ -56,11 +125,6 @@ def save_image(img: np.ndarray, step: int, window_num: int, out_dir: str = "./ou
     cv2.imwrite(path, img_bgr)
     return path
 
-
-def crop_top_fraction(image: ImageRGB, top_frac: float = 1/3) -> ImageRGB:
-    """Remove the top fraction (e.g., sky)."""
-    cut = int(round(image.shape[0] * top_frac))
-    return image[cut:, :, :]
 
 # ---- geometry: HFOV -> intrinsics (rectilinear) ----
 def intrinsics_from_hfov(width: int, height: int, hfov_rad: float) -> np.ndarray:
@@ -82,60 +146,21 @@ def adjust_K_for_crop(K: np.ndarray, crop_top_px: int) -> np.ndarray:
 
 # ---- build a yaw-specific rectilinear->rectilinear remap ----
 
-def make_yaw_lut_rect_to_rect(
-    src_size: Tuple[int, int],      # (W_src, H_src) AFTER CROP
-    dst_hw: int,                    # 96 for 96x96
-    hfov_src: float,                # radians (2.8)
-    hfov_win: float,                # radians (np.deg2rad(60))
-    yaw_deg: float,                 # window center yaw
-    crop_top_px: int                # how many rows were removed from the top
-) -> Tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
+def heatmap_to_vectors(heatmap: np.ndarray) -> np.ndarray:
     """
-    Remap a local 60° pinhole view (dst) into the wide source rectilinear image (src).
-    Returns (map_x, map_y) for cv2.remap.
+    Convert 2D heatmap to row/column sum vectors.
+    
+    Args:
+        heatmap: shape (96, 96) with values in [0, 1]
+    
+    Returns:
+        Vector of shape (192,) where:
+        - [0:96] = column sums (sum over rows for each column)
+        - [96:192] = row sums (sum over columns for each row)
     """
-    Wc, Hc = src_size  # cropped source size
-    assert Wc > 0 and Hc > 0
-
-    # Source intrinsics for the ORIGINAL full frame, then adjust for top crop.
-    # Full height = Hc + crop_top_px
-    K_src_full = intrinsics_from_hfov(Wc, Hc + crop_top_px, hfov_src)
-    K_src = adjust_K_for_crop(K_src_full, crop_top_px)
-    fx_s, fy_s, cx_s, cy_s = K_src[0,0], K_src[1,1], K_src[0,2], K_src[1,2]
-
-    # Target (window) intrinsics for 96x96 and 60° HFOV
-    Wd = Hd = int(dst_hw)
-    K_dst = intrinsics_from_hfov(Wd, Hd, hfov_win)
-    fx_d, fy_d, cx_d, cy_d = K_dst[0,0], K_dst[1,1], K_dst[0,2], K_dst[1,2]
-
-    # Meshgrid of destination pixels
-    xi, yi = np.meshgrid(np.arange(Wd, dtype=np.float32),
-                         np.arange(Hd, dtype=np.float32))
-
-    # Rays in target camera (before yaw)
-    x = (xi - cx_d) / fx_d
-    y = (yi - cy_d) / fy_d
-    z = np.ones_like(x)
-    # Normalize rays (optional; not strictly needed for pinhole projection)
-    norm = np.sqrt(x*x + y*y + z*z)
-    x /= norm; y /= norm; z /= norm
-
-    # Rotate by yaw around the camera vertical axis (Y axis)
-    psi = np.deg2rad(yaw_deg)
-    c, s = np.cos(psi), np.sin(psi)
-    # R_yaw * [x, y, z]
-    xr =  c * x + s * z
-    yr =  y
-    zr = -s * x + c * z
-
-    # Project into source image
-    # If zr <= 0, mark outside (behind camera)
-    eps = 1e-6
-    zr = np.maximum(zr, eps)
-    u = fx_s * (xr / zr) + cx_s
-    v = fy_s * (yr / zr) + cy_s
-
-    return u.astype(np.float32), v.astype(np.float32)
+    col_sums = np.sum(heatmap, axis=0)  # (96,)
+    row_sums = np.sum(heatmap, axis=1)  # (96,)
+    return np.concatenate([col_sums, row_sums])
 
 
 def build_lut_bank(
@@ -226,7 +251,7 @@ class RoverEnvActivVis(gym.Env):
 
         # Stuck detection parameters
         self.stuck_threshold = 0.2   # total distance threshold over window (meters)
-        self.stuck_window = 400      # number of steps to look back
+        self.stuck_window = 300      # number of steps to look back
         self._reference_position: Optional[tuple[float, float]] = None
         self._steps_since_reference = 0
         self.stuck_penalty = -25.0
@@ -392,7 +417,15 @@ class RoverEnvActivVis(gym.Env):
         self.n_pan = 3                                     # 0=none, 1=left, 2=right
         self.action_space = spaces.Discrete(self.n_move * self.n_pan)
         
-        # In __init__, after line 443:
+        # Shared memory connections
+        try:
+            self.rl_obs_shm = shared_memory.SharedMemory(name='rl_observation')
+            self.camera_shm = shared_memory.SharedMemory(name='camera_latest')
+            self.last_obs_step = -1
+            print("Connected to shared memory segments")
+        except FileNotFoundError as e:
+            print(f"Shared memory not found: {e}")
+            raise
         
 
         self.episode_log_path = '/home/jack/src/RoboTerrain/metrics_analyzer/data/episode_logs/'
@@ -407,7 +440,12 @@ class RoverEnvActivVis(gym.Env):
                 dtype=np.uint8
             ),
             'vis_window':spaces.Discrete(5),
-            
+            'heat_vector': spaces.Box(
+                low=0.0,
+                high=96.0,
+                shape=(192,),
+                dtype=np.float32
+            ),
             'imu': spaces.Box(
                 low=np.array([-np.pi, -np.pi, -np.pi]),
                 high=np.array([np.pi, np.pi, np.pi]),
@@ -463,8 +501,9 @@ class RoverEnvActivVis(gym.Env):
         self.actor1_xy: tuple[float, float] | None = None
         self.actor1_pose_subscriber = self.node.create_subscription(
             Pose,
-            '/lower_actor/pose',
-            #'/triangle_actor/pose',
+            '/linear_actor/pose', # inspect
+            #'/lower_actor/pose', # Construct
+            #'/triangle_actor/pose', # island
             self.actor1_pose_callback,
             qos_profile
         )
@@ -472,8 +511,9 @@ class RoverEnvActivVis(gym.Env):
         self.actor2_xy: tuple[float, float] | None = None
         self.actor2_pose_subscriber = self.node.create_subscription(
             Pose,
-            '/upper_actor/pose',
-            #'/triangle2_actor/pose',
+            '/triangle_actor/pose', # inspect
+            #'/upper_actor/pose',  # construct
+            #'/triangle2_actor/pose', # island
             self.actor2_pose_callback,
             qos_profile
         )
@@ -487,13 +527,6 @@ class RoverEnvActivVis(gym.Env):
             qos_profile
         )
 
-        # In __init__, replace rl_obs_shm setup with:
-        self.camera_subscriber = self.node.create_subscription(
-            Image,
-            '/camera/image_raw',
-            self.camera_callback,
-            qos_profile
-        )
 
 
     def _decode_action(self, a: int) -> tuple[int, int]:
@@ -502,55 +535,6 @@ class RoverEnvActivVis(gym.Env):
         pan  = a %  self.n_pan
         return move, pan
         
-
-    def camera_callback(self, msg: Image) -> None:
-        """Store latest fisheye image from camera topic."""
-        try:
-            cv_image: ImageRGB = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
-            self.latest_fisheye_image = cv_image  # Simple assignment, no lock needed
-        except Exception as e:
-            self.node.get_logger().error(f"Error in camera callback: {e}")
-
-
-    def get_camera_window(self) -> ImageRGB:
-        """Return a 96x96 rectified 60° pinhole view at the current yaw bin."""
-        # Wait for an image (same as before)
-        timeout = 2.0
-        t0 = time.time()
-        while self.latest_fisheye_image is None:
-            rclpy.spin_once(self.node, timeout_sec=0.01)
-            if time.time() - t0 > timeout:
-                raise TimeoutError("No camera image received")
-
-        # Crop top fraction (e.g., 1/3) -> 1600x400
-        full_img = self.latest_fisheye_image
-        cropped = crop_top_fraction(full_img, top_frac=self.top_frac)
-
-        # Build LUT bank once (depends on src size and HFOV only)
-        if self._lut_bank is None:
-            H_full = full_img.shape[0]
-            crop_top_px = int(round(H_full * self.top_frac))
-            Hc, Wc = cropped.shape[0], cropped.shape[1]
-
-            self._lut_bank = build_lut_bank(
-                src_size=(Wc, Hc),
-                hfov_src=self.hfov_src,
-                yaws_deg=self.window_yaws_deg,
-                hfov_win_deg=60.0,
-                out_hw=self.out_hw_lut,   # was self.out_hw
-                crop_top_px=crop_top_px
-            )
-
-        idx = int(np.clip(self.current_window_index, 0, len(self.window_yaws_deg)-1))
-
-        # 1) remap to 144x144 (using the precomputed LUT)
-        hi = extract_view_with_lut(cropped, self._lut_bank[idx])        # -> (144,144,3)
-
-        # 2) downsample to 96x96 with area filter (antialiasing)
-        lo = cv2.resize(hi, (self.out_hw, self.out_hw), interpolation=cv2.INTER_AREA)
-        
-        return lo
-
 
     def task_reward(self, observation):
         # Constants
@@ -646,8 +630,10 @@ class RoverEnvActivVis(gym.Env):
         if collision_penalty == 0.0 and self.collision_last == True: # end of collsion
             #ct_2 = time.time() - ct_1
             print('\n################# Robot to close to Actor with act1',
-                  round(actor1_distance,2),' and act2 distances of', 
-                  round(actor2_distance,2), ', act3 distance',  round(actor3_distance,2),
+                  round(actor1_distance,2),
+                  #' and act2 distances of', 
+                  #round(actor2_distance,2),
+                  ', act3 distance',  round(actor3_distance,2),
                   ', total collision', self.total_collision)
             self.collision_last = False
             self.total_collision = 0
@@ -656,6 +642,10 @@ class RoverEnvActivVis(gym.Env):
             if self.collision_last == False:
                 #ct_1 = time.time()
                 print('collision start')
+                if np.sum(observation['heat_vector']) > 300:
+                    print('\n############################################### person predicted with heat_vector sum of:',
+                          np.sum(observation['heat_vector']),'\n' )
+                save_fused_image_channels(observation['image'], self.total_steps, self.current_window_index)
             self.total_collision += collision_penalty 
             self.collision_last = True
         
@@ -680,10 +670,10 @@ class RoverEnvActivVis(gym.Env):
         # Small cost to prevent random panning
         pan_penalty = -0.02 if (self.pan_action != 0) else 0.0
         total_reward += pan_penalty
+
         
-        if self.total_steps % 2_000 == 0:
-            if self.total_steps % 10_000 == 0:
-                save_image(observation['image'], self.total_steps, self.current_window_index)
+        if self.total_steps % 5_000 == 0:
+            #if self.total_steps % 10_000 == 0:
             # print (as you had)
             print(f"\nPose: ({self.current_pose.position.x:.2f}, {self.current_pose.position.y:.2f}), "
                   f"Target: ({self.target_positions_x:.2f}, {self.target_positions_y:.2f}), "
@@ -717,7 +707,10 @@ class RoverEnvActivVis(gym.Env):
         av_align_deg = abs(math.degrees(math.atan2(math.sin(angular_diff), math.cos(angular_diff))))
 
 
-        
+        #if np.sum(observation['heat_vector']) > 0.0:
+        #    print('######################################## human predicted')
+
+
         # Write CSV row with all metrics
         if self.total_steps % 100 == 0:
             self._csv_writer.writerow([
@@ -777,6 +770,8 @@ class RoverEnvActivVis(gym.Env):
         else:
             self._fixlen = 1
             self._last_win_idx = self.current_window_index
+            # Write Active Vision action to shared memory for inference.py
+            write_camera_control(self.camera_shm, self.current_window_index, self.total_steps)
         
         # then movement
         speed_idx     = move_action // self.n_directions
@@ -803,7 +798,6 @@ class RoverEnvActivVis(gym.Env):
             print('Robot flipped, episode done')
             return observation, reward, True, {'steps': self._step, 'total_steps': self.total_steps,
                                                'reward': reward}
-
 
         # Update stuck detection
         pos = (self.current_pose.position.x, self.current_pose.position.y)
@@ -938,20 +932,25 @@ class RoverEnvActivVis(gym.Env):
         dy = self.actor3_xy[1] - ry
         return (dx * dx + dy * dy) < (radius * radius)
 
-    
-    def get_observation(self):
-        return {
 
-            'image': self.get_camera_window(),
+    def get_observation(self):
+        # Read from shared memory
+        attention_heatmap, fused_image, step_count = read_rl_observation(self.rl_obs_shm)
+    
+        # Convert heatmap to vectors
+        heat_vectors = heatmap_to_vectors(attention_heatmap)
+    
+        return {
+            'image': fused_image,
             'vis_window': self.current_window_index,
-            
+            'heat_vector': heat_vectors,  # (192,) float32
             'imu': np.array([self.current_pitch, self.current_roll, self.current_yaw],
                             dtype=np.float32),
             'target': self.get_target_info(),
             'velocities': np.array([self.current_linear_velocity, self.current_angular_velocity],
                                    dtype=np.float32)
-        }    
-
+        }
+    
     
     def heading_controller(self, desired_heading, current_heading):
         """
@@ -1065,6 +1064,8 @@ class RoverEnvActivVis(gym.Env):
         # Reset active vision tracking
         self._fixlen = 1 # AV metric
         self._last_win_idx = self.current_window_index # AV metric
+        # Initialize shared memory with starting window and step=0
+        write_camera_control(self.camera_shm, self.current_window_index, 0)
         
         twist = Twist()
         # Normal operation
