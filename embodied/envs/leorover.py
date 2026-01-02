@@ -202,7 +202,7 @@ class RoverEnvActivVis(gym.Env):
 
     #                            length=3000 for phase 1, 4000 for phase 2
     def __init__(self, size=(96, 96), length=4000, scan_topic='/scan', imu_topic='/imu/data',
-                 cmd_vel_topic='/cmd_vel', world_n='island',
+                 cmd_vel_topic='/cmd_vel', world_n='default',
                  connection_check_timeout=30,
                  rl_obs_name='rl_observation'):
 
@@ -514,8 +514,8 @@ class RoverEnvActivVis(gym.Env):
         self.actor1_pose_subscriber = self.node.create_subscription(
             Pose,
             #'/linear_actor/pose', # inspect
-            #'/lower_actor/pose', # Construct
-            '/triangle_actor/pose', # island
+            '/lower_actor/pose', # Construct
+            #'/triangle_actor/pose', # island
             self.actor1_pose_callback,
             qos_profile
         )
@@ -524,12 +524,13 @@ class RoverEnvActivVis(gym.Env):
         self.actor2_pose_subscriber = self.node.create_subscription(
             Pose,
             #'/triangle_actor/pose', # inspect
-            #'/upper_actor/pose',  # construct
-            '/triangle2_actor/pose', # island
+            '/upper_actor/pose',  # construct
+            #'/triangle2_actor/pose', # island
             self.actor2_pose_callback,
             qos_profile
         )
 
+        """
         self.actor3_xy: tuple[float, float] | None = None
         self.actor3_pose_subscriber = self.node.create_subscription(
             Pose,
@@ -538,7 +539,7 @@ class RoverEnvActivVis(gym.Env):
             self.actor3_pose_callback,
             qos_profile
         )
-
+        """
 
 
     def _decode_action(self, a: int) -> tuple[int, int]:
@@ -606,7 +607,7 @@ class RoverEnvActivVis(gym.Env):
                                        max(0.01, 0.02 - self.current_linear_velocity * 0.01))
         actor1_distance = self.actor1_distance_xy()
         actor2_distance = self.actor2_distance_xy()
-        actor3_distance = self.actor3_distance_xy()
+        #actor3_distance = self.actor3_distance_xy()
         collision_penalty = 0.0
         
         
@@ -627,7 +628,7 @@ class RoverEnvActivVis(gym.Env):
             elif actor2_distance < 1.2:
                 collision_penalty += 2.0
 
-
+        """
         if actor3_distance is not None:
             if actor3_distance < 0.5:
                 collision_penalty += 25.0  # Critical zone
@@ -635,7 +636,7 @@ class RoverEnvActivVis(gym.Env):
                 collision_penalty += 8.0  # Warning zone  
             elif actor3_distance < 1.2:
                 collision_penalty += 2.0  # Awareness zone
-        
+        """
         
         #heatmap_sum = self.get_center_heatmap_sum(observation)
 
@@ -643,9 +644,8 @@ class RoverEnvActivVis(gym.Env):
             #ct_2 = time.time() - ct_1
             print('\n################# Robot to close to an Actor with act1 distance',
                   round(actor1_distance,2),
-                  ' and act2 distances of', 
-                  round(actor2_distance,2),
-                  ', act3 distance',  round(actor3_distance,2),
+                  ' and act2 distances of', round(actor2_distance,2),
+                  #', act3 distance',  round(actor3_distance,2),
                   ', total collision', self.total_collision)
             self.collision_last = False
             self.total_collision = 0
@@ -1086,8 +1086,8 @@ class RoverEnvActivVis(gym.Env):
         self.publisher.publish(twist)
         """Reset the environment to its initial state"""
         super().reset(seed=seed)
-        x_insert = np.random.uniform(*self.rand_x_range)
-        y_insert = np.random.uniform(*self.rand_y_range)
+        #x_insert = np.random.uniform(*self.rand_x_range)
+        #y_insert = np.random.uniform(*self.rand_y_range)
             
         if self.world_name == 'inspect':
             z_insert = 6 # for inspection
