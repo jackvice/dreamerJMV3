@@ -157,7 +157,11 @@ size400m: &size400m
 leorover:
   <<: *size50m
   task: leorover_navigation
-  run: {steps: 5e7, train_ratio: 96, envs: 1}
+  replay.size: 2_000_000
+  run:
+    steps: 1.5e8
+    train_ratio: 64
+    envs: 1
   
 minecraft:
   task: minecraft_diamond

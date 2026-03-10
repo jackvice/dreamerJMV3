@@ -202,7 +202,7 @@ class RoverEnvActivVis(gym.Env):
 
     #                            length=3000 for phase 1, 4000 for phase 2
     def __init__(self, size=(96, 96), length=4000, scan_topic='/scan', imu_topic='/imu/data',
-                 cmd_vel_topic='/cmd_vel', world_n='inspect',
+                 cmd_vel_topic='/cmd_vel', world_n='default',
                  connection_check_timeout=30,
                  rl_obs_name='rl_observation'):
 
@@ -231,9 +231,7 @@ class RoverEnvActivVis(gym.Env):
         
         # Initialize environment parameters
         self.pose_node = None
-        self.world_name = world_n
-
-
+        
         self._length = length
         if world_n == 'island':
             self.world_name = 'moon'
@@ -437,10 +435,6 @@ class RoverEnvActivVis(gym.Env):
         os.makedirs(self.episode_log_path, exist_ok=True)
         self.episode_number = 0
 
-        self._obs_dump_count = 0
-        self._obs_dump_max = 3
-        self._obs_dump_dir = 'obs_dump'
-
         self.observation_space = spaces.Dict({
             'image': spaces.Box(
                 low=0,
@@ -519,8 +513,8 @@ class RoverEnvActivVis(gym.Env):
         self.actor1_xy: tuple[float, float] | None = None
         self.actor1_pose_subscriber = self.node.create_subscription(
             Pose,
-            '/linear_actor/pose', # inspect
-            #'/lower_actor/pose', # Construct
+            #'/linear_actor/pose', # inspect
+            '/lower_actor/pose', # Construct
             #'/triangle_actor/pose', # island
             self.actor1_pose_callback,
             qos_profile
@@ -529,23 +523,23 @@ class RoverEnvActivVis(gym.Env):
         self.actor2_xy: tuple[float, float] | None = None
         self.actor2_pose_subscriber = self.node.create_subscription(
             Pose,
-            '/triangle_actor/pose', # inspect
-            #'/upper_actor/pose',  # construct
+            #'/triangle_actor/pose', # inspect
+            '/upper_actor/pose',  # construct
             #'/triangle2_actor/pose', # island
             self.actor2_pose_callback,
             qos_profile
         )
 
-        
+        """
         self.actor3_xy: tuple[float, float] | None = None
         self.actor3_pose_subscriber = self.node.create_subscription(
             Pose,
-            '/diag_actor/pose',
-            #'/triangle3_actor/pose', # island
+            #'/diag_actor/pose',
+            '/triangle3_actor/pose', # island
             self.actor3_pose_callback,
             qos_profile
         )
-        
+        """
 
 
     def _decode_action(self, a: int) -> tuple[int, int]:
@@ -613,7 +607,7 @@ class RoverEnvActivVis(gym.Env):
                                        max(0.01, 0.02 - self.current_linear_velocity * 0.01))
         actor1_distance = self.actor1_distance_xy()
         actor2_distance = self.actor2_distance_xy()
-        actor3_distance = self.actor3_distance_xy()
+        #actor3_distance = self.actor3_distance_xy()
         collision_penalty = 0.0
         
         
@@ -634,7 +628,7 @@ class RoverEnvActivVis(gym.Env):
             elif actor2_distance < 1.2:
                 collision_penalty += 2.0
 
-        
+        """
         if actor3_distance is not None:
             if actor3_distance < 0.5:
                 collision_penalty += 25.0  # Critical zone
@@ -642,16 +636,17 @@ class RoverEnvActivVis(gym.Env):
                 collision_penalty += 8.0  # Warning zone  
             elif actor3_distance < 1.2:
                 collision_penalty += 2.0  # Awareness zone
-        
+        """
         
         #heatmap_sum = self.get_center_heatmap_sum(observation)
 
         if collision_penalty == 0.0 and self.collision_last == True: # end of collsion
-            def _fmt_dist(d): return 'N/A' if d is None else f'{d:.2f}'
-            print(f'\n################# Robot too close to an Actor with act1 distance {_fmt_dist(actor1_distance)}'
-                  f', act2 distance {_fmt_dist(actor2_distance)}'
-                  f', act3 distance {_fmt_dist(actor3_distance)}'
-                  f', total collision {self.total_collision}')
+            #ct_2 = time.time() - ct_1
+            print('\n################# Robot to close to an Actor with act1 distance',
+                  round(actor1_distance,2),
+                  ' and act2 distances of', round(actor2_distance,2),
+                  #', act3 distance',  round(actor3_distance,2),
+                  ', total collision', self.total_collision)
             self.collision_last = False
             self.total_collision = 0
             
@@ -763,50 +758,6 @@ class RoverEnvActivVis(gym.Env):
         return total_reward
     
 
-    def dump_first_observations(self, obs: dict) -> None:
-        """Write the first N observations to disk for debugging.
-
-        Saves one PNG per observation (the active-vision image) and appends
-        all non-image fields as a single row to a shared CSV file.
-        """
-        if self._obs_dump_count >= self._obs_dump_max:
-            return
-
-        os.makedirs(self._obs_dump_dir, exist_ok=True)
-        idx = self._obs_dump_count
-        csv_path = os.path.join(self._obs_dump_dir, 'observations.csv')
-
-        img = obs['image']
-        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        img_path = os.path.join(self._obs_dump_dir, f'obs_{idx}.png')
-        cv2.imwrite(img_path, img_bgr)
-
-        write_header = (idx == 0)
-        with open(csv_path, 'w' if write_header else 'a', newline='') as f:
-            writer = csv.writer(f)
-            if write_header:
-                writer.writerow([
-                    'obs_idx', 'vis_window',
-                    'heat_vector_sum', 'heat_vector_min', 'heat_vector_max',
-                    'imu_pitch', 'imu_roll', 'imu_yaw',
-                    'target_distance', 'target_rel_angle',
-                    'vel_linear', 'vel_angular',
-                ])
-            hv = obs['heat_vector']
-            imu = obs['imu']
-            tgt = obs['target']
-            vel = obs['velocities']
-            writer.writerow([
-                idx, int(obs['vis_window']),
-                f'{float(hv.sum()):.4f}', f'{float(hv.min()):.4f}', f'{float(hv.max()):.4f}',
-                f'{float(imu[0]):.6f}', f'{float(imu[1]):.6f}', f'{float(imu[2]):.6f}',
-                f'{float(tgt[0]):.4f}', f'{float(tgt[1]):.6f}',
-                f'{float(vel[0]):.4f}', f'{float(vel[1]):.4f}',
-            ])
-
-        self._obs_dump_count += 1
-        print(f'[obs_dump] wrote obs {idx}: {img_path}  ({img.shape}, {img.dtype})')
-
     def step(self, action):
         """Execute one time step within the environment"""
         t0 = time.monotonic()
@@ -851,7 +802,6 @@ class RoverEnvActivVis(gym.Env):
         # Get new observation after action
         rclpy.spin_once(self.node, timeout_sec=0.01)
         observation = self.get_observation()
-        self.dump_first_observations(observation)
         t1 = perf_counter()
         
         # Check state-based termination conditions using new state
@@ -1136,8 +1086,8 @@ class RoverEnvActivVis(gym.Env):
         self.publisher.publish(twist)
         """Reset the environment to its initial state"""
         super().reset(seed=seed)
-        x_insert = np.random.uniform(*self.rand_x_range)
-        y_insert = np.random.uniform(*self.rand_y_range)
+        #x_insert = np.random.uniform(*self.rand_x_range)
+        #y_insert = np.random.uniform(*self.rand_y_range)
             
         if self.world_name == 'inspect':
             z_insert = 6 # for inspection

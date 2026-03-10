@@ -12,6 +12,8 @@ import rclpy
 from typing import Tuple
 import numpy.typing as npt
 from geometry_msgs.msg import PoseStamped, Twist, Pose, PoseArray # , Point, Quaternion
+from ros_gz_interfaces.srv import SetEntityPose
+from ros_gz_interfaces.msg import Entity
 
 from sensor_msgs.msg import LaserScan, Image
 from nav_msgs.msg import Odometry
@@ -78,9 +80,40 @@ def write_camera_control(shm: shared_memory.SharedMemory,
     struct.pack_into('<i', shm.buf, action_offset, action)
     struct.pack_into('<i', shm.buf, action_offset + 4, step_count)
 
+def save_fused_image_channels(fused_image: np.ndarray, step: int, window_num: int, output_dir: str = './out_images') -> None:
+    """
+    Save each channel of fused image as separate PNG files for debugging.
+    
+    Args:
+        fused_image: Fused observation array [H, W, 3] with values in [0,1]
+        output_dir: Directory to save images (default: './out_images')
+    """
+    # Create output directory if it doesn't exist
+    print(' ################### Saving fused image channels')
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Convert from [0,1] to [0,255] and ensure uint8
+    #fused_image_uint8 = (fused_image * 255).astype(np.uint8)
+    fused_image_uint8 = (fused_image).astype(np.uint8)
+    #print(f"DEBUG before save - fused_image dtype: {fused_image.dtype}, min: {fused_image[:,:,1].min()}, max: {fused_image[:,:,1].max()}")
+    # Extract and save each channel
+    now = datetime.now()
+    time_string = now.strftime("%M_%S")
+    #check_black = fused_image_uint8[:, :, 1]
+    #if np.sum(check_black) == 0: # if no person don't bother writing to file
+    #    return 
+    for i in range(3): #(3) for depth
+        channel = fused_image_uint8[:, :, i]
+        filename = f"channel_{step}_{window_num}_{i+1}.png"
+        filepath = os.path.join(output_dir, filename)
+        
+        cv2.imwrite(filepath, channel)
+    
+    print(f"Saved fused image channels to {output_dir}/channel_[1-3].png")
     
 def save_image(img: np.ndarray, step: int, window_num: int, out_dir: str = "./out_images") -> str:
     """Save RGB image safely; supports float[0..1] or uint8. Returns file path."""
+    print('saving fused image shape:', img.shape)
     os.makedirs(out_dir, exist_ok=True)
     if img.dtype != np.uint8:
         img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
@@ -221,7 +254,7 @@ class RoverEnvActivVis(gym.Env):
 
         # Stuck detection parameters
         self.stuck_threshold = 0.2   # total distance threshold over window (meters)
-        self.stuck_window = 400      # number of steps to look back
+        self.stuck_window = 300      # number of steps to look back
         self._reference_position: Optional[tuple[float, float]] = None
         self._steps_since_reference = 0
         self.stuck_penalty = -25.0
@@ -441,6 +474,15 @@ class RoverEnvActivVis(gym.Env):
             cmd_vel_topic,
             10)
 
+        # Service client for pose reset (replaces subprocess calls)
+        self.set_pose_client = self.node.create_client(
+            SetEntityPose,
+            f'/world/{self.world_name}/set_pose'
+        )
+        if not self.set_pose_client.wait_for_service(timeout_sec=5.0):
+            raise RuntimeError(f"/world/{self.world_name}/set_pose service not available")
+
+        
         # Add this line after the existing cmd_vel publisher
         self.event_publisher = self.node.create_publisher(String, '/robot/events', 10)
 
@@ -471,8 +513,9 @@ class RoverEnvActivVis(gym.Env):
         self.actor1_xy: tuple[float, float] | None = None
         self.actor1_pose_subscriber = self.node.create_subscription(
             Pose,
-            '/lower_actor/pose',
-            #'/triangle_actor/pose',
+            #'/linear_actor/pose', # inspect
+            #'/lower_actor/pose', # Construct
+            '/triangle_actor/pose', # island
             self.actor1_pose_callback,
             qos_profile
         )
@@ -480,17 +523,19 @@ class RoverEnvActivVis(gym.Env):
         self.actor2_xy: tuple[float, float] | None = None
         self.actor2_pose_subscriber = self.node.create_subscription(
             Pose,
-            '/upper_actor/pose',
-            #'/triangle2_actor/pose',
+            #'/triangle_actor/pose', # inspect
+            #'/upper_actor/pose',  # construct
+            '/triangle2_actor/pose', # island
             self.actor2_pose_callback,
             qos_profile
         )
 
+
         self.actor3_xy: tuple[float, float] | None = None
         self.actor3_pose_subscriber = self.node.create_subscription(
             Pose,
-            
-            '/diag_actor/pose',
+            #'/diag_actor/pose',
+            '/triangle3_actor/pose', # island
             self.actor3_pose_callback,
             qos_profile
         )
@@ -562,7 +607,8 @@ class RoverEnvActivVis(gym.Env):
                                        max(0.01, 0.02 - self.current_linear_velocity * 0.01))
         actor1_distance = self.actor1_distance_xy()
         actor2_distance = self.actor2_distance_xy()
-        actor3_distance = self.actor3_distance_xy()
+        if self.world_name != 'default': # constuct with 2 actors
+            actor3_distance = self.actor3_distance_xy()
         collision_penalty = 0.0
         
         
@@ -583,23 +629,24 @@ class RoverEnvActivVis(gym.Env):
             elif actor2_distance < 1.2:
                 collision_penalty += 2.0
 
+        if self.world_name != 'default': # constuct with 2 actors
+            if actor3_distance is not None:
+                if actor3_distance < 0.5:
+                    collision_penalty += 25.0  # Critical zone
+                elif actor3_distance < 0.8:
+                    collision_penalty += 8.0  # Warning zone  
+                elif actor3_distance < 1.2:
+                    collision_penalty += 2.0  # Awareness zone
 
-        if actor3_distance is not None:
-            if actor3_distance < 0.5:
-                collision_penalty += 25.0  # Critical zone
-            elif actor3_distance < 0.8:
-                collision_penalty += 8.0  # Warning zone  
-            elif actor3_distance < 1.2:
-                collision_penalty += 2.0  # Awareness zone
-        
         
         #heatmap_sum = self.get_center_heatmap_sum(observation)
 
         if collision_penalty == 0.0 and self.collision_last == True: # end of collsion
             #ct_2 = time.time() - ct_1
-            print('\n################# Robot to close to Actor with act1',
-                  round(actor1_distance,2),' and act2 distances of', 
-                  round(actor2_distance,2), ', act3 distance',  round(actor3_distance,2),
+            print('\n################# Robot to close to an Actor with act1 distance',
+                  round(actor1_distance,2),
+                  ' and act2 distances of', round(actor2_distance,2),
+                  ', act3 distance',  round(actor3_distance,2),
                   ', total collision', self.total_collision)
             self.collision_last = False
             self.total_collision = 0
@@ -608,6 +655,10 @@ class RoverEnvActivVis(gym.Env):
             if self.collision_last == False:
                 #ct_1 = time.time()
                 print('collision start')
+                if np.sum(observation['heat_vector']) > 300:
+                    print('\n############################################### person predicted with heat_vector sum of:',
+                          np.sum(observation['heat_vector']),'\n' )
+                    save_fused_image_channels(observation['image'], self.total_steps, self.current_window_index)
             self.total_collision += collision_penalty 
             self.collision_last = True
         
@@ -632,10 +683,10 @@ class RoverEnvActivVis(gym.Env):
         # Small cost to prevent random panning
         pan_penalty = -0.02 if (self.pan_action != 0) else 0.0
         total_reward += pan_penalty
+
         
-        if self.total_steps % 2_000 == 0:
-            if self.total_steps % 10_000 == 0:
-                save_image(observation['image'], self.total_steps, self.current_window_index)
+        if self.total_steps % 5_000 == 0:
+            #if self.total_steps % 10_000 == 0:
             # print (as you had)
             print(f"\nPose: ({self.current_pose.position.x:.2f}, {self.current_pose.position.y:.2f}), "
                   f"Target: ({self.target_positions_x:.2f}, {self.target_positions_y:.2f}), "
@@ -669,7 +720,10 @@ class RoverEnvActivVis(gym.Env):
         av_align_deg = abs(math.degrees(math.atan2(math.sin(angular_diff), math.cos(angular_diff))))
 
 
-        
+        #if np.sum(observation['heat_vector']) > 0.0:
+        #    print('######################################## human predicted')
+
+
         # Write CSV row with all metrics
         if self.total_steps % 100 == 0:
             self._csv_writer.writerow([
@@ -757,7 +811,6 @@ class RoverEnvActivVis(gym.Env):
             print('Robot flipped, episode done')
             return observation, reward, True, {'steps': self._step, 'total_steps': self.total_steps,
                                                'reward': reward}
-
 
         # Update stuck detection
         pos = (self.current_pose.position.x, self.current_pose.position.y)
@@ -1075,22 +1128,25 @@ class RoverEnvActivVis(gym.Env):
         reset_cmd_str = ('name: "leo_rover", ' +
                         f'position: {{x: {x_insert}, y: {y_insert}, z: {z_insert}}}, ' +
                         f'orientation: {{x: 0, y: 0, z: {quat_z}, w: {quat_w}}}')
-        
-        # Reset robot pose using ign service
+
+        # Reset robot pose using ROS2 service client
         try:
-            reset_cmd = [
-                'ign', 'service', '-s', self.world_pose_path,
-                '--reqtype', 'ignition.msgs.Pose',
-                '--reptype', 'ignition.msgs.Boolean',
-                '--timeout', '2000',
-                '--req', 'name: "leo_rover", position: {x: ' + str(x_insert) +
-                ',y: '+ str(y_insert) +
-                ', z: '+ str(z_insert) + '}, orientation: {x: 0, y: 0, z: ' +
-                str(quat_z) + ', w: ' + str(quat_w) + '}'
-            ]
-            result = subprocess.run(reset_cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                print(f"Failed to reset robot pose: {result.stderr}")
+            request = SetEntityPose.Request()
+            request.entity.name = 'leo_rover'
+            request.entity.type = Entity.MODEL
+            request.pose.position.x = float(x_insert)
+            request.pose.position.y = float(y_insert)
+            request.pose.position.z = float(z_insert)
+            request.pose.orientation.x = 0.0
+            request.pose.orientation.y = 0.0
+            request.pose.orientation.z = float(quat_z)
+            request.pose.orientation.w = float(quat_w)
+            
+            future = self.set_pose_client.call_async(request)
+            rclpy.spin_until_future_complete(self.node, future, timeout_sec=2.0)
+            
+            if future.result() is None:
+                print(f"Failed to reset robot pose: service call timed out")
         except Exception as e:
             print(f"Error executing reset command: {str(e)}")
 
@@ -1106,8 +1162,8 @@ class RoverEnvActivVis(gym.Env):
         self.previous_distance = None
         
         # Add a small delay to ensure the robot has time to reset
-        for _ in range(100):  # Increased from 3 to 5 to allow more time for pose reset
-            rclpy.spin_once(self.node, timeout_sec=0.1)
+        #for _ in range(100):  # Increased from 3 to 5 to allow more time for pose reset
+        #    rclpy.spin_once(self.node, timeout_sec=0.1)
         time.sleep(1.0)        
         observation = self.get_observation()
         # Normal operation
