@@ -253,6 +253,11 @@ class RoverEnvActivVis(gym.Env):
         
         self.collision_last = False
         self.total_collision = 0
+        self._collision_min_dist: dict[str, float] = {
+            'actor1': float('inf'),
+            'actor2': float('inf'),
+            'actor3': float('inf'),
+        }
 
         # Stuck detection parameters
         self.stuck_threshold = 0.2   # total distance threshold over window (meters)
@@ -367,7 +372,8 @@ class RoverEnvActivVis(gym.Env):
             self.too_far_away_high_y = 30  # 29 for inspection
         self.too_far_away_penilty = -10 # -25.0
 
-        self.goal_reward = 100.0  # phase 2
+        self.goal_reward = 50.0
+        self.collision_entry_penalty = 40.0
         
         self.last_time = time.time()
         # Add at the end of your existing __init__ 
@@ -608,8 +614,10 @@ class RoverEnvActivVis(gym.Env):
         
         heat_penalty = 0.0
         time_penalty = time_penalty_scale
-        # Penalize spinning more when not moving forward
-        spin_penalty = spin_penalty_scale * (abs(self.current_angular_velocity) *
+        # Penalize aggressive spinning, but allow small course corrections
+        ang_vel_abs = abs(self.current_angular_velocity)
+        spin_excess = max(0.0, ang_vel_abs - 1.0)
+        spin_penalty = spin_penalty_scale * (spin_excess *
                                        max(0.01, 0.02 - self.current_linear_velocity * 0.01))
         actor1_distance = self.actor1_distance_xy()
         actor2_distance = self.actor2_distance_xy()
@@ -646,24 +654,32 @@ class RoverEnvActivVis(gym.Env):
         
         #heatmap_sum = self.get_center_heatmap_sum(observation)
 
-        if collision_penalty == 0.0 and self.collision_last == True: # end of collsion
-            def _fmt_dist(d): return 'N/A' if d is None else f'{d:.2f}'
-            print(f'\n################# Robot too close to an Actor with act1 distance {_fmt_dist(actor1_distance)}'
-                  f', act2 distance {_fmt_dist(actor2_distance)}'
-                  f', act3 distance {_fmt_dist(actor3_distance)}'
-                  f', total collision {self.total_collision}')
+        if collision_penalty == 0.0 and self.collision_last == True: # end of collision
+            def _fmt_dist(d): return 'N/A' if d == float('inf') else f'{d:.2f}'
+            m = self._collision_min_dist
+            print(f'\n################# Robot too close to an Actor — closest distances:'
+                  f' act1={_fmt_dist(m["actor1"])}'
+                  f', act2={_fmt_dist(m["actor2"])}'
+                  f', act3={_fmt_dist(m["actor3"])}'
+                  f', total collision penalty={self.total_collision:.1f}')
             self.collision_last = False
             self.total_collision = 0
-            
-        if collision_penalty >= 8.0: # collision
-            if self.collision_last == False:
-                #ct_1 = time.time()
+            self._collision_min_dist = {k: float('inf') for k in self._collision_min_dist}
+
+        if collision_penalty > 0.0:
+            if not self.collision_last and collision_penalty >= 8.0:
+                collision_penalty += self.collision_entry_penalty
                 print('collision start')
                 if np.sum(observation['heat_vector']) > 300:
                     print('\n############################################### person predicted with heat_vector sum of:',
                           np.sum(observation['heat_vector']),'\n' )
-                    save_fused_image_channels(observation['image'], self.total_steps, self.current_window_index)
-            self.total_collision += collision_penalty 
+            if actor1_distance is not None:
+                self._collision_min_dist['actor1'] = min(self._collision_min_dist['actor1'], actor1_distance)
+            if actor2_distance is not None:
+                self._collision_min_dist['actor2'] = min(self._collision_min_dist['actor2'], actor2_distance)
+            if actor3_distance is not None:
+                self._collision_min_dist['actor3'] = min(self._collision_min_dist['actor3'], actor3_distance)
+            self.total_collision += collision_penalty
             self.collision_last = True
         
         
@@ -729,7 +745,7 @@ class RoverEnvActivVis(gym.Env):
 
 
         # Write CSV row with all metrics
-        if self.total_steps % 100 == 0:
+        if self.total_steps % 1000 == 0:
             self._csv_writer.writerow([
                 self._step,                                  # step
                 time.time(),                                 # time_s
@@ -848,8 +864,10 @@ class RoverEnvActivVis(gym.Env):
         self.publisher.publish(twist)
         self.last_speed = speed
         
-        # Get new observation after action
-        rclpy.spin_once(self.node, timeout_sec=0.01)
+        # Get new observation after action — spin multiple times so
+        # pose/odom callbacks have a chance to process the latest messages.
+        for _ in range(3):
+            rclpy.spin_once(self.node, timeout_sec=0.003)
         observation = self.get_observation()
         self.dump_first_observations(observation)
         t1 = perf_counter()
