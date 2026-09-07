@@ -10,6 +10,9 @@ class FromGym(embodied.Env):
 
   def __init__(self, env, obs_key='image', act_key='action', **kwargs):
     if isinstance(env, str):
+      # The passive checker uses np.bool8, which NumPy 2 removed, and it
+      # assumes the new step/reset API that these envs do not implement.
+      kwargs.setdefault('disable_env_checker', True)
       self._env = gym.make(env, **kwargs)
     else:
       assert not kwargs, kwargs
